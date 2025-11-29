@@ -49,7 +49,8 @@ class SerialTransport(Transport):
 
 
 class SocketTransport(Transport):
-    def __init__(self, ip, port):
+    DEFAULT_PORT = 23 # telnet
+    def __init__(self, ip, port=DEFAULT_PORT):
         self.addr = (ip, port)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.settimeout(4)

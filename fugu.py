@@ -1,9 +1,10 @@
 import collections
 import re
 import time
-from math import nan
 from threading import Thread
 from typing import Optional, Literal, Union
+
+from math import nan
 
 from .transport import SocketTransport, Transport, SerialTransport
 from .util import get_logger
@@ -85,6 +86,9 @@ class FuguDevice:
         self._rx_thread = Thread(target=self._recv_loop, daemon=True)
         self._rx_thread.start()
 
+        self.verbose = False
+        self.on_message = None
+
         if block:
             while self.pwm_state.ccm is None:
                 time.sleep(0.1)
@@ -107,6 +111,9 @@ class FuguDevice:
             try:
                 rx_b = self.transport.read()
                 rx = rx_b.decode('utf-8').strip()
+            except TimeoutError as e:
+                time.sleep(.2)
+                continue
             except UnicodeDecodeError as e:
                 print('decode error', e)
                 time.sleep(1)
@@ -119,8 +126,11 @@ class FuguDevice:
             # always log errors, warnings, etc
             words = ('shutdown', 'error', 'warn', 'disabled', 'enabled', 'failed', 'reset', 'boot', 'backtrace',
                      'exception')
-            if (any(map(lambda w: w in rx, words)) or b'\x1b[0;33mW ' in rx_b or b'\x1b[0;33mE ' in rx_b):
-                logger.warning(self.prefix + 'Ser: %s', rx)
+            if self.verbose:
+                print(self.prefix + rx, flush=True)
+            else:
+                if (any(map(lambda w: w in rx, words)) or b'\x1b[0;33mW ' in rx_b or b'\x1b[0;33mE ' in rx_b):
+                    logger.warning(self.prefix + 'Ser: %s', rx)
 
             m = RE_PWM.search(rx)
             if m:
@@ -143,6 +153,7 @@ class FuguDevice:
 
             self.ser_deque.append(rx)
             self.ser_tail.append(rx)
+            self.on_message and self.on_message(rx)
 
             logger.debug('  %s  FUGU: %s', self.prefix, rx)
 
