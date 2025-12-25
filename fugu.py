@@ -82,7 +82,7 @@ class FuguDevice:
 
         self.temperatures = []
 
-        self.open = True
+        self.is_open = True
         self._rx_thread = Thread(target=self._recv_loop, daemon=True)
         self._rx_thread.start()
 
@@ -93,6 +93,10 @@ class FuguDevice:
             while self.pwm_state.ccm is None:
                 time.sleep(0.1)
 
+    def open(self):
+        assert not self.is_open
+        raise NotImplementedError()
+
     def wait_for_pwm_state(self):
         assert self._rx_thread.is_alive()
         self.pwm_state = PwmState(None, 0, 0, 0)
@@ -100,14 +104,15 @@ class FuguDevice:
             time.sleep(0.1)
 
     def close(self, close_transport=True):
-        self.open = False
+        self.is_open = False
+        self.pwm_state = PwmState(None, 0, 0, 0)
         if self._rx_thread.is_alive():
             self._rx_thread.join()
         if close_transport:
             self.transport.close()
 
     def _recv_loop(self):
-        while self.open:
+        while self.is_open:
             try:
                 rx_b = self.transport.read()
                 rx = rx_b.decode('utf-8').strip()
