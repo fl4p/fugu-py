@@ -261,7 +261,7 @@ class FuguDevice:
         dev.sync_rect_enable(False)
         dev.ideal_diode_enable(False)
         while dev.voltages[0] > 80 or dev.voltages[0] < 70:
-            print('waiting for input voltage to converge', dev.voltages)
+            print(self.prefix, 'waiting for input voltage to converge', dev.voltages)
             time.sleep(1)
 
         dev.set_D(400)

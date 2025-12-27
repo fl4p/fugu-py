@@ -52,19 +52,19 @@ class SerialTransport(Transport):
 class SocketTransport(Transport):
     DEFAULT_PORT = 23  # telnet
 
-    def __init__(self, ip, port=DEFAULT_PORT, is_telnet=True):
+    def __init__(self, ip, port=DEFAULT_PORT, timeout=4, is_telnet=True):
         self.addr = (ip, port)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(6)
+        self.sock.settimeout(timeout)
         self.is_telnet = is_telnet
         self.t_last_comm = time.time()
-
 
     def open(self):
         logger.info('connecting to %s:%u', *self.addr)
         self.sock.connect(self.addr)
 
     def close(self):
+        self.t_last_comm = 0
         self.sock.close()
 
     def read(self):
@@ -76,10 +76,11 @@ class SocketTransport(Transport):
                 # check conn health
                 if self.is_telnet:
                     self.write(bytes([255, 241]))  # send telnet NOP to probe conn TODO Are you there 246 ?
+            return r
         except BrokenPipeError:
             print(self.sock, 'BrokenPipeError')
             self.close()
-        return r
+            raise
 
     def write(self, data):
         i = self.sock.send(data)
@@ -88,7 +89,7 @@ class SocketTransport(Transport):
         return i
 
     def check_connection(self) -> bool:
-        if time.time() - self.t_last_comm < 2:
+        if time.time() - self.t_last_comm < 4:
             return True
 
         try:
