@@ -1,5 +1,6 @@
 import collections
 import re
+import sys
 import time
 from threading import Thread
 from typing import Optional, Literal, Union
@@ -103,10 +104,10 @@ class FuguDevice:
         while self.pwm_state.ccm is None:
             time.sleep(0.1)
 
-    def close(self, close_transport=True):
+    def close(self, close_transport=True, join_rx=True):
         self.is_open = False
         self.pwm_state = PwmState(None, 0, 0, 0)
-        if self._rx_thread.is_alive():
+        if join_rx and self._rx_thread.is_alive():
             self._rx_thread.join()
         if close_transport:
             self.transport.close()
@@ -123,6 +124,12 @@ class FuguDevice:
                 print('decode error', e)
                 time.sleep(1)
                 continue
+            except OSError as e:
+                print(self.prefix, 'I/O error', e)
+                self.close(close_transport=True, join_rx=False)
+            except Exception as e:
+                print(self.prefix, 'error reading', type(e), e)
+                print(sys.exc_info())
 
             if not rx:
                 time.sleep(.01)
@@ -270,7 +277,11 @@ class FuguDevice:
 
 
 if __name__ == '__main__':
-    dev = FuguDevice(ip='192.168.178.222')
+    dev = FuguDevice(ip='192.168.4.2')
+
+    dev.command_ack("reset")
+
+    sys.exit(0)
 
     pwm_cnt = 300
     while True:
