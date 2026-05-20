@@ -1,7 +1,14 @@
 import time
+from typing import List, Tuple
 
 
-def discover_scope_servers(stop_after=99, timeout=1):
+def discover_scope_servers(stop_after=99, timeout=1) -> List[Tuple[str, int, str]]:
+    """
+    Discovers scope server hosts on the network
+    :param stop_after:
+    :param timeout:
+    :return: a list of tuple(addr,port,name)
+    """
     from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
 
     addr = []

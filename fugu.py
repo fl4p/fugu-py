@@ -171,7 +171,7 @@ class FuguDevice:
 
     def get_conf_value(self, file, key):
         self.command_ack(f"get-config {file} {key}")
-        rex = re.compile(rf".+: Conf '/littlefs/conf/{file}:{key}' = '(.*)'")
+        rex = re.compile(rf"(.+: )?Conf '/littlefs/conf/{file}:{key}' = '(.*)'")
         for l in reversed(self.ser_tail):
             if m := rex.match(l):
                 return m.group(1)
