@@ -161,7 +161,7 @@ class BleTransport(Transport):
         name = (self.name or "").lower()
         return await BleakScanner.find_device_by_filter(
             lambda d, adv: (self.NUS_SERVICE in (s.lower() for s in (adv.service_uuids or [])))
-                           or (name and name in (d.name or "").lower()),
+                           and bool(name and name in (d.name or "").lower()),
             timeout=self.scan_timeout,
         )
 
@@ -224,3 +224,105 @@ class BleTransport(Transport):
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread is not None:
             self._thread.join(timeout=2)
+
+
+class MqttTransport(Transport):
+    """Console over MQTT, via the broker the device is configured to use.
+
+    The firmware mirrors all console output to `pv/log/<hostname>` and (with the command
+    subscription in `MqttService::onStart`) accepts commands on `pv/log/<hostname>/cmd`; the
+    OK/ERR marker comes back on the log topic. `device` is matched as a substring of the
+    advertised hostname (like the BLE name filter); the full hostname is learned from the first
+    log message and used for the command topic. Requires `paho-mqtt`.
+
+    `writable=False` makes it a read-only monitor — `write()` is a no-op, so it streams the
+    device's output without ever publishing commands.
+    """
+
+    LOG_ROOT = "pv/log/"
+
+    def __init__(self, host, port=1883, username=None, password=None, device="fugu",
+                 writable=True, discover_timeout=10.0, read_timeout=0.3):
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.device = device or ""
+        self.writable = writable
+        self.discover_timeout = discover_timeout
+        self.read_timeout = read_timeout
+        self.hostname = None  # full device hostname, learned from the first matching log topic
+        self._rx: "queue.Queue[bytes]" = queue.Queue()
+        self._buf = b''
+        self._client = None
+        self._learned = threading.Event()
+
+    def open(self):
+        if self._client is not None:
+            return
+        import paho.mqtt.client as mqtt
+        from paho.mqtt.enums import CallbackAPIVersion
+        c = mqtt.Client(CallbackAPIVersion.VERSION2)
+        if self.username:
+            c.username_pw_set(self.username, self.password or "")
+        c.on_message = self._on_message
+        logger.info("connecting to broker %s:%u", self.host, self.port)
+        c.connect(self.host, self.port, 60)
+        c.subscribe(self.LOG_ROOT + "#")  # output is pv/log/<hostname>, cmd echo is .../cmd
+        c.loop_start()
+        self._client = c
+        # learn the device hostname from its log stream (needed to address the command topic)
+        if not self._learned.wait(self.discover_timeout):
+            if self.device:
+                logger.warning("no log seen on %s*%s*; assuming hostname=%r",
+                               self.LOG_ROOT, self.device, self.device)
+                self.hostname = self.device
+            else:
+                raise RuntimeError(f"no device publishing under {self.LOG_ROOT}")
+
+    def _on_message(self, _client, _userdata, msg):
+        parts = msg.topic.split("/")
+        if len(parts) != 3:
+            return  # pv/log/<hostname> only; ignore the deeper .../cmd echo
+        hostname = parts[2]
+        if self.device.lower() not in hostname.lower():
+            return
+        if self.hostname is None:
+            self.hostname = hostname
+            logger.info("device hostname: %s", hostname)
+            self._learned.set()
+        self._rx.put(msg.payload)
+
+    def read(self) -> bytes:
+        deadline = time.time() + self.read_timeout
+        while True:
+            nl = self._buf.find(b'\n')
+            if nl >= 0:
+                line, self._buf = self._buf[:nl + 1], self._buf[nl + 1:]
+                return line
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return b''
+            try:
+                self._buf += self._rx.get(timeout=remaining)
+            except queue.Empty:
+                return b''
+
+    def write(self, data: bytes):
+        if not self.writable:
+            return  # read-only monitor
+        if not self.hostname:
+            raise RuntimeError("device hostname unknown; cannot publish command")
+        # MQTT is message-framed, not a byte stream: publish one trimmed command per write
+        cmd = data.decode("utf-8", "replace").strip()
+        if cmd:
+            self._client.publish(f"{self.LOG_ROOT}{self.hostname}/cmd", cmd, qos=0)
+
+    def close(self):
+        if self._client is not None:
+            try:
+                self._client.loop_stop()
+                self._client.disconnect()
+            except Exception as e:
+                logger.debug("mqtt disconnect: %s", e)
+            self._client = None

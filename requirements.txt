@@ -1,3 +1,4 @@
 pyserial
 bleak  # optional, for BleTransport (BLE / Nordic UART Service)
+paho-mqtt  # optional, for MqttTransport (console over the device's MQTT broker)
 # tqdm # optional

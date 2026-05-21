@@ -45,3 +45,7 @@ def discover_scope_servers(stop_after=99, timeout=1) -> List[Tuple[str, int, str
         zeroconf.close()
 
     return list(addrs)
+
+
+if __name__ == '__main__':
+    print(discover_scope_servers())
