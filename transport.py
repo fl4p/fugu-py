@@ -30,8 +30,9 @@ class Transport(object):
 
 class SerialTransport(Transport):
 
-    def __init__(self, port, timeout: Optional[float] = None):
+    def __init__(self, port, baud=115200, timeout: Optional[float] = None):
         self.port = port
+        self.baud = baud
         self.timeout = timeout
         self.ser: Optional[serial.Serial] = None
 
@@ -41,8 +42,8 @@ class SerialTransport(Transport):
         port = self.port
         if '*' in port:
             port = glob.glob(port)[0]
-        logger.info(f'opening serial port {port}')
-        self.ser = serial.Serial(port, baudrate=115200, timeout=self.timeout)
+        logger.info(f'opening serial port {port} @ {self.baud}')
+        self.ser = serial.Serial(port, baudrate=self.baud, timeout=self.timeout)
 
     def write(self, data: bytes):
         self.ser.write(data)
