@@ -1,2 +1,3 @@
 pyserial
+bleak  # optional, for BleTransport (BLE / Nordic UART Service)
 # tqdm # optional

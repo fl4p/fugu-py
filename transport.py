@@ -1,5 +1,8 @@
+import asyncio
 import glob
+import queue
 import socket
+import threading
 import time
 from typing import Optional
 
@@ -27,8 +30,9 @@ class Transport(object):
 
 class SerialTransport(Transport):
 
-    def __init__(self, port):
+    def __init__(self, port, timeout: Optional[float] = None):
         self.port = port
+        self.timeout = timeout
         self.ser: Optional[serial.Serial] = None
 
     def open(self):
@@ -38,7 +42,7 @@ class SerialTransport(Transport):
         if '*' in port:
             port = glob.glob(port)[0]
         logger.info(f'opening serial port {port}')
-        self.ser = serial.Serial(port, baudrate=115200)
+        self.ser = serial.Serial(port, baudrate=115200, timeout=self.timeout)
 
     def write(self, data: bytes):
         self.ser.write(data)
@@ -110,3 +114,112 @@ class SocketTransport(Transport):
             print("unexpected exception when checking if a socket is closed", type(e), e)
             return True
         return True
+
+
+class BleTransport(Transport):
+    """Nordic UART Service (NUS) link to the firmware's BleConsoleService.
+
+    Bridges bleak's asyncio API to the synchronous Transport interface: a private event loop runs
+    in a background thread, notifications are pushed into a byte queue, and read() hands back one
+    decoded line at a time (ANSI kept raw, like the serial/socket transports). Requires `bleak`.
+    """
+
+    NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+    RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # write  (host -> device)
+    TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # notify (device -> host)
+    ATT_CHUNK = 20  # conservative pre-MTU-negotiation ATT payload
+
+    def __init__(self, name="fugu", address=None, scan_timeout=10.0, connect_retries=3,
+                 read_timeout=0.3):
+        self.name = name
+        self.address = address
+        self.scan_timeout = scan_timeout
+        self.connect_retries = connect_retries
+        self.read_timeout = read_timeout
+        self._rx: "queue.Queue[bytes]" = queue.Queue()
+        self._buf = b''
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._client = None
+
+    def _submit(self, coro):
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+
+    def open(self):
+        if self._client is not None:
+            return
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
+        self._thread.start()
+        self._submit(self._connect())
+
+    async def _find_device(self):
+        from bleak import BleakScanner
+        if self.address:
+            return await BleakScanner.find_device_by_address(self.address, timeout=self.scan_timeout)
+        name = (self.name or "").lower()
+        return await BleakScanner.find_device_by_filter(
+            lambda d, adv: (self.NUS_SERVICE in (s.lower() for s in (adv.service_uuids or [])))
+                           or (name and name in (d.name or "").lower()),
+            timeout=self.scan_timeout,
+        )
+
+    async def _connect(self):
+        from bleak import BleakClient
+        dev = await self._find_device()
+        if dev is None:
+            raise RuntimeError("no device advertising NUS found (is it advertising? `svc on ble`)")
+        logger.info("connecting to %s [%s]", dev.name, dev.address)
+        # macOS can keep a stale bond after a reflash ("Peer removed pairing information"); the
+        # failed attempt usually drops the bond, so retry a couple of times.
+        last = None
+        client = BleakClient(dev)
+        for attempt in range(1, self.connect_retries + 1):
+            try:
+                await client.connect()
+                break
+            except Exception as e:
+                last = e
+                logger.warning("connect attempt %d failed: %s", attempt, e)
+                if attempt == self.connect_retries:
+                    raise RuntimeError(f"could not connect after {attempt} attempts: {last}")
+                await asyncio.sleep(1.5)
+        await client.start_notify(self.TX_UUID, self._on_notify)
+        self._client = client
+
+    def _on_notify(self, _char, data: bytearray):
+        self._rx.put(bytes(data))
+
+    def read(self) -> bytes:
+        deadline = time.time() + self.read_timeout
+        while True:
+            nl = self._buf.find(b'\n')
+            if nl >= 0:
+                line, self._buf = self._buf[:nl + 1], self._buf[nl + 1:]
+                return line
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return b''
+            try:
+                self._buf += self._rx.get(timeout=remaining)
+            except queue.Empty:
+                return b''
+
+    def write(self, data: bytes):
+        # write-with-response: the RX char requires an encrypted write under
+        # ble_security=justworks|passkey, and some stacks drop write-without-response there.
+        for off in range(0, len(data), self.ATT_CHUNK):
+            self._submit(self._client.write_gatt_char(
+                self.RX_UUID, data[off:off + self.ATT_CHUNK], response=True))
+
+    def close(self):
+        if self._client is not None:
+            try:
+                self._submit(self._client.disconnect())
+            except Exception as e:
+                logger.debug("ble disconnect: %s", e)
+            self._client = None
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread is not None:
+            self._thread.join(timeout=2)

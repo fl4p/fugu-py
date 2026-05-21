@@ -2,11 +2,11 @@ import collections
 import re
 import sys
 import time
-from threading import Thread
 from typing import Optional, Literal, Union
 
 from math import nan
 
+from .console import Console
 from .transport import SocketTransport, Transport, SerialTransport
 from .util import get_logger
 
@@ -66,6 +66,8 @@ class FuguDevice:
     def __init__(self, transport: Transport = None, ip=None, prefix='', block=True):
         self.pwm_state = PwmState(None, 0, 0, 0)
         self.wifi_rssi = 0
+        self.temperatures = []
+        self.voltages = []
 
         if ip:
             assert transport is None
@@ -73,22 +75,16 @@ class FuguDevice:
         elif transport is None:
             transport = SerialTransport(FuguDevice.get_default_serial_port())
 
-        self.ser_deque = collections.deque()
         self.ser_tail = collections.deque(maxlen=20)
         self.prefix = prefix
-
         self.transport = transport
-
-        self.transport.open()
-
-        self.temperatures = []
-
-        self.is_open = True
-        self._rx_thread = Thread(target=self._recv_loop, daemon=True)
-        self._rx_thread.start()
-
         self.verbose = False
         self.on_message = None
+
+        self.is_open = True
+        # Console owns the reader thread and line assembly. _on_line taps every line for the
+        # continuous PWM-status parse / logging; command replies come back via console.command().
+        self.console = Console(transport, eol='\n', on_line=self._on_line)
 
         if block:
             while self.pwm_state.ccm is None:
@@ -99,7 +95,7 @@ class FuguDevice:
         raise NotImplementedError()
 
     def wait_for_pwm_state(self):
-        assert self._rx_thread.is_alive()
+        assert self.console.is_alive()
         self.pwm_state = PwmState(None, 0, 0, 0)
         while self.pwm_state.ccm is None:
             time.sleep(0.1)
@@ -107,74 +103,52 @@ class FuguDevice:
     def close(self, close_transport=True, join_rx=True):
         self.is_open = False
         self.pwm_state = PwmState(None, 0, 0, 0)
-        if join_rx and self._rx_thread.is_alive():
-            self._rx_thread.join()
-        if close_transport:
-            self.transport.close()
+        self.console.close()
 
-    def _recv_loop(self):
-        while self.is_open:
-            try:
-                rx_b = self.transport.read()
-                rx = rx_b.decode('utf-8').strip()
-            except TimeoutError as e:
-                time.sleep(.2)
-                continue
-            except UnicodeDecodeError as e:
-                print('decode error', e)
-                time.sleep(1)
-                continue
-            except OSError as e:
-                print(self.prefix, 'I/O error', e)
-                self.close(close_transport=True, join_rx=False)
-            except Exception as e:
-                print(self.prefix, 'error reading', type(e), e)
-                print(sys.exc_info())
+    def _on_line(self, rx: str):
+        """Tap for every assembled line (already ANSI-stripped): keep PWM state / temps / voltages
+        current and surface warnings, the way the old receive loop did."""
+        if not rx:
+            return
 
-            if not rx:
-                time.sleep(.01)
-                continue
+        # always log errors, warnings, etc (ANSI is stripped, so match the ESP log W/E prefix too)
+        words = ('shutdown', 'error', 'warn', 'disabled', 'enabled', 'failed', 'reset', 'boot', 'backtrace',
+                 'exception')
+        if self.verbose:
+            print(self.prefix + rx, flush=True)
+        elif any(w in rx for w in words) or rx.startswith(('W (', 'E (')):
+            logger.warning(self.prefix + 'Ser: %s', rx)
 
-            # always log errors, warnings, etc
-            words = ('shutdown', 'error', 'warn', 'disabled', 'enabled', 'failed', 'reset', 'boot', 'backtrace',
-                     'exception')
-            if self.verbose:
-                print(self.prefix + rx, flush=True)
+        m = RE_PWM.search(rx)
+        if m:
+            d = m.groupdict()
+            s = PwmState(d['mode'] == 'CCM',
+                         pwm_ctrl=int(d['ctrl']),
+                         pwm_sync=int(d['sync']),
+                         pwm_sync_max=int(d['sync_max']))
+            self.wifi_rssi = int(d.get('rssi', 0))
+            self.temperatures = [float(d.get('tmp_ntc', nan)), float(d.get('tmp_mcu', nan))]
+            self.voltages = [float(d.get('vin', nan)), float(d.get('vout', nan))]
+
+            if self.pwm_state != s:
+                self.pwm_state = s
             else:
-                if (any(map(lambda w: w in rx, words)) or b'\x1b[0;33mW ' in rx_b or b'\x1b[0;33mE ' in rx_b):
-                    logger.warning(self.prefix + 'Ser: %s', rx)
+                return
 
-            m = RE_PWM.search(rx)
-            if m:
-                d = m.groupdict()
-                s = PwmState(d['mode'] == 'CCM',
-                             pwm_ctrl=int(d['ctrl']),
-                             pwm_sync=int(d['sync']),
-                             pwm_sync_max=int(d['sync_max']))
-                self.wifi_rssi = int(d.get('rssi', 0))
-                self.temperatures = [float(d.get('tmp_ntc', nan)), float(d.get('tmp_mcu', nan))]
-                self.voltages = [float(d.get('vin', nan)), float(d.get('vout', nan))]
+        if 'ina22x' in rx and 'timeout' in rx:
+            return
 
-                if self.pwm_state != s:
-                    self.pwm_state = s
-                else:
-                    continue
+        self.ser_tail.append(rx)
+        self.on_message and self.on_message(rx)
 
-            if 'ina22x' in rx and 'timeout' in rx:
-                continue
-
-            self.ser_deque.append(rx)
-            self.ser_tail.append(rx)
-            self.on_message and self.on_message(rx)
-
-            logger.debug('  %s  FUGU: %s', self.prefix, rx)
+        logger.debug('  %s  FUGU: %s', self.prefix, rx)
 
     def get_conf_value(self, file, key):
         self.command_ack(f"get-config {file} {key}")
         rex = re.compile(rf"(.+: )?Conf '/littlefs/conf/{file}:{key}' = '(.*)'")
         for l in reversed(self.ser_tail):
             if m := rex.match(l):
-                return m.group(1)
+                return m.group(2)  # group(1) is the optional log prefix; group(2) is the value
         return None
 
     def manual_pwm(self, en=True):
@@ -212,29 +186,14 @@ class FuguDevice:
         self.transport.write(cmd.encode('utf-8'))
 
     def command_ack(self, cmd: str):
-        ser_deque = self.ser_deque
-        ser_deque.clear()
-
-        self.write(cmd.strip() + '\n')
-
-        l = ""
-        ok_resp = "OK: " + cmd.strip()
-        for _ in range(1, 20):
-            while len(ser_deque):
-                l = ser_deque.popleft()
-                if ok_resp in l.strip():
-                    return True
-            time.sleep(0.1)
-
-        if len(ser_deque) == 0:
-            logger.info('Never received anything')
-
-        while len(ser_deque):
-            logger.warning(self.prefix + 'Ser: %s', ser_deque.popleft())
-
-        raise Exception(f"unexpected serial response '{l}' for command '{cmd}")
-
-        self.transport.write(cmd.encode('utf-8'))
+        reply = self.console.command(cmd.strip())
+        if reply.ok:
+            return True
+        if reply.timed_out and not reply:
+            logger.info(self.prefix + 'Never received anything')
+        for l in reply:
+            logger.warning(self.prefix + 'Ser: %s', l)
+        raise Exception(f"unexpected serial response for command '{cmd}'")
 
     def sync_rect_enable(self, state: Union[bool, Literal['forced']]):
         if state == 'forced':
@@ -250,7 +209,7 @@ class FuguDevice:
         return self
 
     def is_connected(self):
-        return self._rx_thread.is_alive()
+        return self.console.is_alive()
 
     def power_loop_rig_sequence_buck(dev, target_d=770):
         dev.wifi_power(False)
