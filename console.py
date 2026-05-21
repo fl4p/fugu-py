@@ -90,7 +90,49 @@ class Console:
     def write(self, text: str):
         self.transport.write(text.encode("utf-8"))
 
-    def command(self, cmd: str, timeout: float = 4.0) -> Reply:
+    def reconnect(self):
+        """Tear down and re-open the transport, restarting the reader thread if it died."""
+        try:
+            self.transport.close()
+        except Exception as e:
+            logger.debug("reconnect close: %s", e)
+        self.transport.open()
+        if not self._reader.is_alive():
+            self._reader = threading.Thread(target=self._read_loop, daemon=True)
+            self._reader.start()
+
+    def command(self, cmd: str, timeout: float = 4.0, retry=False) -> Reply:
+        """Send `cmd`, collect reply lines until the OK/ERR marker, a rejection, or timeout.
+
+        `retry` reconnects and retries on a transport error or timeout, backing off between
+        attempts: pass an int for the attempt count, or True for a default of 5.
+        """
+        if not retry:
+            return self._command(cmd, timeout)
+        attempts = retry if isinstance(retry, int) and not isinstance(retry, bool) else 5
+        backoff, last = 0.5, None
+        for attempt in range(1, attempts + 1):
+            try:
+                reply = self._command(cmd, timeout)
+                if not reply.timed_out:
+                    return reply
+                last = reply
+                logger.warning("command %r timed out (%d/%d)", cmd, attempt, attempts)
+            except Exception as e:
+                last = e
+                logger.warning("command %r failed: %s (%d/%d)", cmd, e, attempt, attempts)
+            if attempt < attempts:
+                try:
+                    self.reconnect()
+                except Exception as e:
+                    logger.warning("reconnect failed: %s", e)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 8.0)
+        if isinstance(last, Exception):
+            raise last
+        return last  # the final timed-out Reply
+
+    def _command(self, cmd: str, timeout: float) -> Reply:
         self.drain()
         self.write(cmd + self.eol)
         ok_marker, err_marker = "OK: " + cmd, "ERR: " + cmd

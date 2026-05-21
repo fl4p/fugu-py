@@ -59,18 +59,26 @@ class SocketTransport(Transport):
 
     def __init__(self, ip, port=DEFAULT_PORT, timeout=4, is_telnet=True):
         self.addr = (ip, port)
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(timeout)
+        self.timeout = timeout
+        self.sock = None
         self.is_telnet = is_telnet
         self.t_last_comm = time.time()
 
     def open(self):
+        # fresh socket every time so open() can be used to reconnect after a drop
+        self.close()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
         logger.info('connecting to %s:%u', *self.addr)
         self.sock.connect(self.addr)
+        self.t_last_comm = time.time()
+        logger.info('connected to %s:%u', *self.addr)
 
     def close(self):
         self.t_last_comm = 0
-        self.sock.close()
+        if self.sock is not None:
+            self.sock.close()
+            self.sock = None
 
     def read(self):
         try:
@@ -159,11 +167,16 @@ class BleTransport(Transport):
         if self.address:
             return await BleakScanner.find_device_by_address(self.address, timeout=self.scan_timeout)
         name = (self.name or "").lower()
-        return await BleakScanner.find_device_by_filter(
-            lambda d, adv: (self.NUS_SERVICE in (s.lower() for s in (adv.service_uuids or [])))
-                           and bool(name and name in (d.name or "").lower()),
-            timeout=self.scan_timeout,
-        )
+
+        def match(d, adv):
+            has_nus = self.NUS_SERVICE in (s.lower() for s in (adv.service_uuids or []))
+            # The firmware carries the NUS UUID in the scan response, which macOS surfaces only
+            # sporadically; when a name filter is given, trust it (NUS is verified at connect).
+            if name:
+                return name in (d.name or "").lower()
+            return has_nus
+
+        return await BleakScanner.find_device_by_filter(match, timeout=self.scan_timeout)
 
     async def _connect(self):
         from bleak import BleakClient
