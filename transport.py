@@ -2,6 +2,7 @@ import asyncio
 import glob
 import queue
 import socket
+import sys
 import threading
 import time
 from typing import Optional
@@ -202,8 +203,29 @@ class BleTransport(Transport):
                 if attempt == self.connect_retries:
                     raise RuntimeError(f"could not connect after {attempt} attempts: {last}")
                 await asyncio.sleep(1.5)
-        await client.start_notify(self.TX_UUID, self._on_notify)
+        try:
+            await client.start_notify(self.TX_UUID, self._on_notify)
+        except Exception as e:
+            self._explain_cccd_failure(dev, e)
+            raise
         self._client = client
+
+    @staticmethod
+    def _explain_cccd_failure(dev, e):
+        # macOS caches the GATT table per bonded peer; after a BLE OTA shifts attribute handles the
+        # cached CCCD handle no longer maps to the TX descriptor and the subscribe write is rejected
+        # with ATT code 3 ("Writing is not permitted"). Forgetting the bond clears the stale cache.
+        msg = str(e).lower()
+        if sys.platform != "darwin" or ("not permitted" not in msg and "code=3" not in msg):
+            return
+        logger.error(
+            "enabling notifications failed — this is macOS using a stale cached GATT for a bonded\n"
+            "  device (the cache no longer matches the firmware after a BLE OTA), not a device fault.\n"
+            "  Clear it and reconnect:\n"
+            "    blueutil --unpair $(blueutil --paired | sed -n 's/.*address: \\([^,]*\\),.*name: \"%s\".*/\\1/p')\n"
+            "    # or: System Settings > Bluetooth > %s > Forget This Device\n"
+            "  then toggle Bluetooth off/on and reconnect.",
+            dev.name or "<device>", dev.name or "the device")
 
     def _on_notify(self, _char, data: bytearray):
         self._rx.put(bytes(data))

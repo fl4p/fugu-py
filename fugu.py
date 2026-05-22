@@ -1,10 +1,17 @@
+"""
+
+
+
+
+
+
+"""
 import collections
 import re
 import sys
 import time
-from typing import Optional, Literal, Union
-
 from math import nan
+from typing import Optional, Literal, Union
 
 from .console import Console
 from .transport import SocketTransport, Transport, SerialTransport
@@ -19,6 +26,14 @@ RE_PWM = re.compile(
     fr'([0-9.]+)W (?P<tmp_ntc>{r_float})℃(?P<tmp_mcu>{r_float})℃\s.*'
     r'(?P<mode>[CD]CM)\(H\|L\|Lm\)=\s*(?P<ctrl>[0-9]+)\|\s*(?P<sync>[0-9]+)\|\s*(?P<sync_max>[0-9]+)\s.+'
     r'rssi=\s*(?P<rssi>-?[0-9]+)'
+)
+
+# Crash/panic markers in the serial log. `rst:0x..` is intentionally NOT here: the bootloader prints
+# it on every reset (incl. a clean `restart` and power-on), so it signals a reboot, not a crash.
+# Extend as needed.
+RE_CRASH = re.compile(
+    r"Guru Meditation|panic'?ed|Backtrace:|abort\(\) was called|"
+    r"StoreProhibited|LoadProhibited|assert failed"
 )
 
 
@@ -81,6 +96,13 @@ class FuguDevice:
         self.verbose = False
         self.on_message = None
 
+        # crash/reboot tracking. _last_crash_time is set from the reader thread in _on_line();
+        # _last_uptime is updated by has_rebooted()/get_uptime() polls.
+        self._last_crash_time = None       # monotonic time a panic marker was last logged
+        self._crash_baseline_time = time.monotonic()  # has_crashed() reset point
+        self._rebooted = False             # sticky reboot flag, cleared by has_rebooted(reset=True)
+        self._last_uptime = None           # last device uptime (s) seen, for regression detection
+
         self.is_open = True
         # Console owns the reader thread and line assembly. _on_line taps every line for the
         # continuous PWM-status parse / logging; command replies come back via console.command().
@@ -110,6 +132,10 @@ class FuguDevice:
         current and surface warnings, the way the old receive loop did."""
         if not rx:
             return
+
+        if RE_CRASH.search(rx):
+            self._last_crash_time = time.monotonic()
+            logger.warning(self.prefix + 'crash detected: %s', rx)
 
         # always log errors, warnings, etc (ANSI is stripped, so match the ESP log W/E prefix too)
         words = ('shutdown', 'error', 'warn', 'disabled', 'enabled', 'failed', 'reset', 'boot', 'backtrace',
@@ -142,6 +168,73 @@ class FuguDevice:
         self.on_message and self.on_message(rx)
 
         logger.debug('  %s  FUGU: %s', self.prefix, rx)
+
+    def get_uptime(self):
+        """Device uptime in seconds (monotonic since boot, resets only on reboot), or None.
+        Polls the `uptime` command; works on any transport."""
+        for l in self.query('uptime'):
+            if m := re.search(r'Uptime:\s*(\d+)\s*s', l):
+                return int(m.group(1))
+        return None
+
+    def get_app_info(self):
+        """Running app description from the `uptime` command's App line, as
+        {project, version, built, idf}, or None. (esp_app_get_description())"""
+        for l in self.query('uptime'):
+            if m := re.search(r'App:\s*(\S+)\s+(\S+)\s+\(built (.+), IDF (.+)\)', l):
+                return dict(project=m.group(1), version=m.group(2), built=m.group(3), idf=m.group(4))
+        return None
+
+    def crash_mark(self):
+        """Snapshot (monotonic_now, uptime_s) to pass back to crashed():
+        `m = dev.crash_mark(); ...; if dev.crashed(*m): ...`."""
+        return time.monotonic(), self.get_uptime()
+
+    def has_crashed(self, reset=False):
+        """True if a panic/crash marker was seen since the console opened (or since the last
+        reset=True). Serial only: over telnet/BLE/MQTT the panic output and link are lost, so a
+        crash can't be observed here — use has_rebooted() instead. Even on serial, native USB-CDC
+        (usb_serial_jtag) re-enumerates on the reboot that follows a panic, so the dump can be cut
+        off and the reader stop; a hardware UART bridge is more reliable."""
+        if not isinstance(self.transport, SerialTransport):
+            raise RuntimeError("has_crashed requires a serial transport; use has_rebooted()")
+        crashed = self._last_crash_time is not None and self._last_crash_time >= self._crash_baseline_time
+        if reset:
+            self._crash_baseline_time = time.monotonic()
+        return crashed
+
+    def has_rebooted(self, reset=False):
+        """True if the device rebooted since the console opened (or since the last reset=True).
+        Polls `uptime` and flags a reboot when it regresses; works on any transport. Call
+        periodically so a reboot is caught before uptime climbs back past the previous reading."""
+        up = self.get_uptime()
+        if up is not None:
+            if self._last_uptime is not None and up < self._last_uptime:
+                self._rebooted = True
+                logger.warning(self.prefix + 'reboot detected (uptime %ds -> %ds)', self._last_uptime, up)
+            self._last_uptime = up
+        rebooted = self._rebooted
+        if reset:
+            self._rebooted = False
+        return rebooted
+
+    def crashed_since(self, since=None, baseline_uptime=None, margin=5.0):
+        """Stateless crash/reboot query against a caller-held baseline (see crash_mark()).
+        `since`: a monotonic timestamp — True if a panic marker was logged after it (serial only;
+        silently skipped on other transports). `baseline_uptime`: a device uptime read earlier —
+        True if the device has since rebooted, i.e. the current uptime is less than baseline_uptime
+        plus the wall time elapsed since `since` (so a late check still catches it). Either argument
+        may be None to skip that check."""
+        if since is not None and isinstance(self.transport, SerialTransport):
+            if self._last_crash_time is not None and self._last_crash_time > since:
+                return True
+        if baseline_uptime is not None:
+            up = self.get_uptime()
+            if up is not None:
+                elapsed = (time.monotonic() - since) if since is not None else 0.0
+                if up + margin < baseline_uptime + elapsed:
+                    return True
+        return False
 
     def get_conf_value(self, file, key):
         self.command_ack(f"get-config {file} {key}")
@@ -179,8 +272,18 @@ class FuguDevice:
         # self.transport.send(b'dc %d\n' % pwm_cnt)
         logger.debug('Set pwm_cnt = %d', pwm_cnt)
 
-    def wifi_power(self, on):
-        self.transport.write(b'wifi %s\n' % (b'on' if on else b'off'))
+    def wifi_power(self, on, minutes=None):
+        # not acked: turning Wi-Fi off drops telnet/BLE, so an OK marker may never arrive.
+        # `minutes` re-enables after a timeout (keeps the stored SSID); bare off forgets it.
+        if on:
+            self.write('wifi on\n')
+        elif minutes:
+            self.write('wifi off %d\n' % int(minutes))
+        else:
+            self.write('wifi off\n')
+
+    def wifi_add(self, ssid, password):
+        self.command_ack('wifi-add %s:%s' % (ssid, password))
 
     def write(self, cmd: str):
         self.transport.write(cmd.encode('utf-8'))
@@ -201,8 +304,141 @@ class FuguDevice:
         else:
             self.command_ack('sync ' + str(int(state)))
 
-    def ideal_diode_enable(self, enable):
-        self.command_ack('bf-enable' if enable else 'bf-disable')
+    def backflow_enable(self, enable):
+        # bf/panel switch (output->input). requires manual PWM and a configured backflow switch.
+        self.command_ack('bf 1' if enable else 'bf 0')
+
+    # the "ideal diode" is the backflow switch; kept as an alias for older callers
+    ideal_diode_enable = backflow_enable
+
+    def query(self, cmd: str, timeout: float = 4.0):
+        """Run a command and return its Reply (the lines before the OK marker). Raises on
+        rejection/timeout, like command_ack."""
+        reply = self.console.command(cmd.strip(), timeout=timeout)
+        if reply.ok:
+            return reply
+        for l in reply:
+            logger.warning(self.prefix + 'Ser: %s', l)
+        raise Exception(f"unexpected serial response for command '{cmd}'")
+
+    # --- tracker / converter -------------------------------------------------------------------
+
+    def sweep(self):
+        self.command_ack('sweep')
+
+    def mppt_enable(self):
+        # leave manual PWM, resume MPP tracking
+        self.command_ack('mppt')
+
+    def set_speed(self, scale: float):
+        self.command_ack('speed %g' % scale)
+
+    def short_ls(self):
+        # boost topology with Vin~0 only
+        self.command_ack('short-ls')
+
+    # --- charger limits (runtime only; use set_config to persist) ------------------------------
+
+    def set_vbat_max(self, volts: float):
+        self.command_ack('vset %g' % volts)
+
+    def set_ibat_lim(self, amps: float):
+        self.command_ack('iset %g' % amps)
+
+    # --- misc actuators ------------------------------------------------------------------------
+
+    def set_fan(self, percent: float):
+        self.command_ack('fan %g' % percent)
+
+    def set_led(self, color):
+        # hex 'RRGGBB' or short 'RGB'
+        self.command_ack('led %s' % color)
+
+    # --- config files --------------------------------------------------------------------------
+
+    def set_config(self, file, key, value):
+        self.command_ack('set-config %s %s %s' % (file, key, value))
+
+    def del_config(self, file, key):
+        self.command_ack('del-config %s %s' % (file, key))
+
+    # --- system / diagnostics ------------------------------------------------------------------
+
+    def restart(self):
+        self.write('restart\n')  # device reboots; no OK marker comes back
+
+    def adc_restart(self):
+        self.command_ack('adc-restart')
+
+    def adc_reset(self):
+        self.command_ack('adc-reset')
+
+    def reset_lag(self):
+        self.command_ack('reset-lag')
+
+    def scan_i2c(self):
+        self.command_ack('scan-i2c')
+
+    def rt_stats(self):
+        # the per-task stats are printed asynchronously (sampled over ~1 s) after the OK marker,
+        # so they surface via the _on_line tap, not the returned ack.
+        self.command_ack('rt-stats')
+
+    def set_hostname(self, name):
+        self.command_ack('hostname %s' % name)
+
+    def get_hostname(self):
+        for l in self.query('hostname'):
+            if m := re.search(r'Hostname:\s*(\S+)', l):
+                return m.group(1)
+        return None
+
+    def get_ip(self):
+        for l in self.query('ip'):
+            if m := re.search(r'Local IP Address:\s*(\S+)', l):
+                return m.group(1)
+        return None
+
+    def get_mem(self):
+        keys = {'Total heap': 'heap_total', 'Free heap': 'heap_free',
+                'Total PSRAM': 'psram_total', 'Free PSRAM': 'psram_free'}
+        mem = {}
+        for l in self.query('mem'):
+            if m := re.search(r'(Total heap|Free heap|Total PSRAM|Free PSRAM):\s*(\d+)', l):
+                mem[keys[m.group(1)]] = int(m.group(2))
+        return mem
+
+    def get_sensor_avg(self):
+        """Compact EWM averages as a dict, e.g. {'vin': .., 'vout': .., 'iout': ..}."""
+        for l in self.query('sensor avg'):
+            if 'sens:' in l:
+                return {k: float(v) for k, v in re.findall(r'(\w+)=(nan|-?\d+\.?\d*(?:e-?\d+)?)', l)}
+        return {}
+
+    def get_sensors(self) -> str:
+        """Full per-sensor dump as raw text."""
+        return self.query('sensor').text
+
+    # --- services ------------------------------------------------------------------------------
+
+    def svc_list(self):
+        """Parse `svc list` into a list of {name, state, log, enabled, detail} dicts."""
+        out = []
+        for l in self.query('svc'):
+            parts = l.split(None, 4)
+            if len(parts) < 4 or parts[3] not in ('yes', 'no'):
+                continue  # skip the header and any interleaved status lines
+            out.append({'name': parts[0], 'state': parts[1], 'log': parts[2],
+                        'enabled': parts[3] == 'yes', 'detail': parts[4] if len(parts) > 4 else ''})
+        return out
+
+    def svc(self, action, name=None, level=None):
+        """svc on|off|restart|rs <name>, svc log <name> <level>, or svc list (-> svc_list())."""
+        if action == 'list':
+            return self.svc_list()
+        if action == 'log':
+            return self.command_ack('svc log %s %s' % (name, level))
+        return self.command_ack('svc %s %s' % (action, name))
 
     def __iadd__(self, i):
         self.set_D(self.pwm_state.pwm_ctrl + i)
