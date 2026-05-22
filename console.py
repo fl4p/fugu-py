@@ -101,15 +101,39 @@ class Console:
             self._reader = threading.Thread(target=self._read_loop, daemon=True)
             self._reader.start()
 
-    def command(self, cmd: str, timeout: float = 4.0, retry=False) -> Reply:
+    def recover(self, budget=120.0, probe_timeout=5.0) -> bool:
+        """Reconnect a dropped link and wait for the device to answer, up to `budget` s.
+
+        Reconnects with exponential backoff (1 s, capped at 15 s) and probes via `wait_ready` each
+        round, riding out a router/NAT outage that outlasts `command`'s built-in retries. Returns
+        True once the console answers, False if the budget runs out.
+        """
+        deadline = time.monotonic() + budget
+        delay = 1.0
+        while time.monotonic() < deadline:
+            try:
+                self.reconnect()
+                if self.wait_ready(timeout=probe_timeout):
+                    return True
+            except Exception as e:
+                logger.warning("recover attempt failed: %s", e)
+            time.sleep(delay)
+            delay = min(delay * 2, 15.0)
+        return False
+
+    def command(self, cmd: str, timeout: float = 4.0, retry=False, recover=0.0) -> Reply:
         """Send `cmd`, collect reply lines until the OK/ERR marker, a rejection, or timeout.
 
         `retry` reconnects and retries on a transport error or timeout, backing off between
-        attempts: pass an int for the attempt count, or True for a default of 5.
+        attempts: pass an int for the attempt count, or True for a default of 5. `recover` is a
+        seconds budget for a deeper last resort: if the fast retries are exhausted, ride out a
+        longer outage via `recover()` and re-issue the command once. Still raises / returns the
+        final timed-out Reply if the device never comes back.
         """
-        if not retry:
+        if not retry and not recover:
             return self._command(cmd, timeout)
-        attempts = retry if isinstance(retry, int) and not isinstance(retry, bool) else 5
+        attempts = (retry if isinstance(retry, int) and not isinstance(retry, bool)
+                    else (5 if retry else 1))
         backoff, last = 0.5, None
         for attempt in range(1, attempts + 1):
             try:
@@ -128,6 +152,14 @@ class Console:
                     logger.warning("reconnect failed: %s", e)
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 8.0)
+        if recover and self.recover(recover):
+            try:
+                reply = self._command(cmd, timeout)
+                if not reply.timed_out:
+                    return reply
+                last = reply
+            except Exception as e:
+                last = e
         if isinstance(last, Exception):
             raise last
         return last  # the final timed-out Reply

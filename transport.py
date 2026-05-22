@@ -77,6 +77,10 @@ class SocketTransport(Transport):
     def close(self):
         self.t_last_comm = 0
         if self.sock is not None:
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)  # wake a recv() blocked in the reader thread
+            except OSError:
+                pass
             self.sock.close()
             self.sock = None
 
