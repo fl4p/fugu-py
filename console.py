@@ -40,15 +40,29 @@ class Console:
     rejection, or a timeout. Works the same over serial, TCP/telnet, or BLE.
     """
 
-    def __init__(self, transport: Transport, eol="\r\n", on_line=None, maxlines=2000):
+    def __init__(self, transport: Transport, eol="\r\n", on_line=None, maxlines=2000,
+                 wait_banner=False, banner_marker="to disconnect.", banner_timeout=2.0,
+                 min_post_connect=1.2):
         self.transport = transport
         self.eol = eol
         self.on_line = on_line
         self.maxlines = maxlines
+        self.banner_marker = banner_marker
+        self.banner_timeout = banner_timeout
+        # Earliest moment a first command can safely be written after open(). ESPTelnet drops
+        # any input that arrives in roughly the first second after TCP connect (the banner
+        # finishes far earlier — ~100 ms — but the input pump isn't ready yet; bytes sent
+        # before then are silently swallowed or coalesced). Measured threshold on flat: writes
+        # at 0.92 s dropped, writes at 1.11 s landed. 1.2 s gives margin.
+        self.min_post_connect = min_post_connect
+        # One-shot guard before the first command. For non-banner transports (serial, MQTT,
+        # BLE) leave wait_banner=False; the guard stays disarmed and command() runs as before.
+        self._needs_banner = bool(wait_banner)
         self._buf = b''
         self._lines: "queue.Queue[str]" = queue.Queue()
         self._stop = threading.Event()
         transport.open()
+        self._connect_time = time.monotonic()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
 
@@ -97,9 +111,45 @@ class Console:
         except Exception as e:
             logger.debug("reconnect close: %s", e)
         self.transport.open()
+        self._connect_time = time.monotonic()
+        # re-arm the banner wait so the next command rides the new connection's handshake
+        self._needs_banner = bool(self.banner_marker)
         if not self._reader.is_alive():
             self._reader = threading.Thread(target=self._read_loop, daemon=True)
             self._reader.start()
+
+    def wait_for_banner(self, marker: str = None, timeout: float = None) -> bool:
+        """Block until a line containing `marker` arrives AND `min_post_connect` has elapsed
+        since open(); returns True if the marker was seen, False on timeout.
+
+        Used as a one-shot handshake settle before the first command on transports where the
+        device sends a banner (telnet's "Welcome … (Use ^] + q  to disconnect.)"). on_line still
+        fires for the consumed lines from the read thread, so interactive callers don't lose them.
+        The post-connect floor matters because the banner arrives well before ESPTelnet starts
+        accepting input (~100 ms vs ~1 s on flat); without it, commands written right after the
+        marker still get dropped.
+        """
+        marker = marker if marker is not None else self.banner_marker
+        timeout = timeout if timeout is not None else self.banner_timeout
+        deadline = time.monotonic() + timeout
+        seen = False
+        while True:
+            if seen and time.monotonic() - self._connect_time >= self.min_post_connect:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # On timeout, still honor the post-connect floor so the caller's first write
+                # doesn't race the device even if the banner never arrives.
+                floor = self._connect_time + self.min_post_connect - time.monotonic()
+                if floor > 0:
+                    time.sleep(floor)
+                return seen
+            try:
+                line = self._lines.get(timeout=remaining)
+            except queue.Empty:
+                continue
+            if marker in line:
+                seen = True
 
     def recover(self, budget=120.0, probe_timeout=5.0) -> bool:
         """Reconnect a dropped link and wait for the device to answer, up to `budget` s.
@@ -165,6 +215,9 @@ class Console:
         return last  # the final timed-out Reply
 
     def _command(self, cmd: str, timeout: float) -> Reply:
+        if self._needs_banner:
+            self._needs_banner = False  # one-shot, regardless of outcome
+            self.wait_for_banner()
         self.drain()
         self.write(cmd + self.eol)
         ok_marker, err_marker = "OK: " + cmd, "ERR: " + cmd

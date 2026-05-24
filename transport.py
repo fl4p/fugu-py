@@ -95,6 +95,13 @@ class SocketTransport(Transport):
                 if self.is_telnet:
                     self.write(bytes([255, 241]))  # send telnet NOP to probe conn TODO Are you there 246 ?
             return r
+        except socket.timeout:
+            # recv() hit the socket-level timeout, not a disconnect — return empty so the read
+            # loop just keeps polling. Long-running commands (notably `ota <url>` during the
+            # HTTP connect window before any progress logs flow) can go silent for > self.timeout
+            # seconds; without this, the reader thread dies and Console.command() waits forever
+            # for an OK marker that's still queued on the device.
+            return b''
         except BrokenPipeError:
             print(self.sock, 'BrokenPipeError')
             self.close()
