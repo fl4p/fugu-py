@@ -70,6 +70,17 @@ class SocketTransport(Transport):
         self.close()
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.settimeout(self.timeout)
+        # TCP keepalive so we notice silently-dead peers (e.g. ESP32 reboot mid-OTA without
+        # a clean FIN) within ~10 s instead of waiting on the default ~2 h.
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for _name, _val in (('TCP_KEEPIDLE', 3), ('TCP_KEEPALIVE', 3),
+                            ('TCP_KEEPINTVL', 2), ('TCP_KEEPCNT', 3)):
+            _opt = getattr(socket, _name, None)
+            if _opt is not None:
+                try:
+                    self.sock.setsockopt(socket.IPPROTO_TCP, _opt, _val)
+                except OSError:
+                    pass
         logger.info('connecting to %s:%u', *self.addr)
         self.sock.connect(self.addr)
         self.t_last_comm = time.time()
@@ -88,8 +99,12 @@ class SocketTransport(Transport):
     def read(self):
         try:
             r = self.sock.recv(1024)
-            if r:
-                self.t_last_comm = time.time()
+            if not r:
+                # recv()==b'' on a connected stream socket is EOF (peer sent FIN).
+                # Tear down so callers stop polling and the reader thread exits.
+                self.close()
+                return b''
+            self.t_last_comm = time.time()
             if time.time() - self.t_last_comm > 1:
                 # check conn health
                 if self.is_telnet:
@@ -102,8 +117,9 @@ class SocketTransport(Transport):
             # seconds; without this, the reader thread dies and Console.command() waits forever
             # for an OK marker that's still queued on the device.
             return b''
-        except BrokenPipeError:
-            print(self.sock, 'BrokenPipeError')
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            # keepalive failure surfaces as ETIMEDOUT here; treat any of these as disconnect
+            print(self.sock, type(e).__name__, e)
             self.close()
             raise
 
@@ -114,14 +130,18 @@ class SocketTransport(Transport):
         return i
 
     def check_connection(self) -> bool:
+        if self.sock is None:
+            return False
         if time.time() - self.t_last_comm < 4:
             return True
 
         try:
-            # this will try to read bytes without blocking and also without removing them from buffer (peek only)
+            # peek without blocking and without consuming the buffer
             data = self.sock.recv(16, socket.MSG_DONTWAIT | socket.MSG_PEEK)
             if len(data) == 0:
-                return True
+                # peer closed cleanly (FIN). recv() returning 0 on a stream socket = EOF.
+                self.close()
+                return False
         except ConnectionResetError as e:
             print(type(e), e)
             self.close()
@@ -130,7 +150,8 @@ class SocketTransport(Transport):
             return True  # socket is open and reading from it would block
         except OSError as e:
             print(type(e), e)
-            return False  # 'Bad file descriptor' (socket closed locally)
+            self.close()
+            return False  # 'Bad file descriptor' or keepalive ETIMEDOUT
         except Exception as e:
             print("unexpected exception when checking if a socket is closed", type(e), e)
             return True
