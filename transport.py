@@ -81,10 +81,10 @@ class SocketTransport(Transport):
                     self.sock.setsockopt(socket.IPPROTO_TCP, _opt, _val)
                 except OSError:
                     pass
-        logger.info('connecting to %s:%u', *self.addr)
+        logger.debug('connecting to %s:%u', *self.addr)
         self.sock.connect(self.addr)
         self.t_last_comm = time.time()
-        logger.info('connected to %s:%u', *self.addr)
+        logger.debug('connected to %s:%u', *self.addr)
 
     def close(self):
         self.t_last_comm = 0
@@ -119,7 +119,7 @@ class SocketTransport(Transport):
             return b''
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
             # keepalive failure surfaces as ETIMEDOUT here; treat any of these as disconnect
-            print(self.sock, type(e).__name__, e)
+            logger.debug("socket read failed (%s): %s — closing", type(e).__name__, e)
             self.close()
             raise
 
@@ -143,17 +143,17 @@ class SocketTransport(Transport):
                 self.close()
                 return False
         except ConnectionResetError as e:
-            print(type(e), e)
+            logger.debug("check_connection: ConnectionResetError: %s", e)
             self.close()
             return False  # socket was closed for some other reason
         except BlockingIOError:
             return True  # socket is open and reading from it would block
         except OSError as e:
-            print(type(e), e)
+            logger.debug("check_connection: OSError: %s", e)
             self.close()
             return False  # 'Bad file descriptor' or keepalive ETIMEDOUT
         except Exception as e:
-            print("unexpected exception when checking if a socket is closed", type(e), e)
+            logger.warning("check_connection: unexpected %s: %s", type(e).__name__, e)
             return True
         return True
 
