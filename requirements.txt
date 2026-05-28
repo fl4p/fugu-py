@@ -1,4 +1,5 @@
 pyserial
 bleak  # optional, for BleTransport (BLE / Nordic UART Service)
+aioesphomeapi  # optional, for EspHomeBleTransport (BLE NUS via an ESPHome bluetooth_proxy)
 paho-mqtt  # optional, for MqttTransport (console over the device's MQTT broker)
 # tqdm # optional

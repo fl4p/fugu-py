@@ -1,4 +1,10 @@
 
+## Transports (`transport.py`)
+
+`SerialTransport`, `SocketTransport` (telnet), `BleTransport` (local BLE / Nordic UART Service),
+`EspHomeBleTransport` (BLE NUS through an ESPHome `bluetooth_proxy` with `active: true`, over the
+plaintext native API — no noise PSK; needs `aioesphomeapi`), and `MqttTransport`.
+
 ## has_crashed(reset=False)
 if the device has crashed (panic) since the console was created or since the last call with reset=True
 * detect a panic with re.compile(r"Guru Meditation|panic'?ed|Backtrace:|abort\(\) was called|StoreProhibited|LoadProhibited|assert failed")
