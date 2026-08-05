@@ -226,11 +226,34 @@ class BleTransport(Transport):
 
         return await BleakScanner.find_device_by_filter(match, timeout=self.scan_timeout)
 
+    async def _discovery_hint(self):
+        """`--name`/`--address` missed, or the connect failed: say what IS in range.
+
+        A bare "not found" can't distinguish "nothing is advertising" from "your filter is wrong"
+        from "it is there but won't accept a connection" — three different fixes. Never raises:
+        this only ever decorates an error that is already on its way out.
+        """
+        try:
+            from bleak import BleakScanner
+            found = await BleakScanner.discover(timeout=min(self.scan_timeout, 8.0), return_adv=True)
+        except Exception as e:
+            return f" (discovery failed: {e})"
+        seen = []
+        for d, adv in found.values():
+            nm = d.name or ""
+            if "fugu" in nm.lower() or self.NUS_SERVICE in (s.lower() for s in (adv.service_uuids or [])):
+                seen.append(f"{nm or '?'} [{d.address}] rssi {adv.rssi}")
+        if not seen:
+            return " (no fugu/NUS devices advertising at all)"
+        return " — advertising now: " + ", ".join(sorted(seen))
+
     async def _connect(self):
         from bleak import BleakClient
         dev = await self._find_device()
         if dev is None:
-            raise RuntimeError("no device advertising NUS found (is it advertising? `svc on ble`)")
+            what = f"name~{self.name!r}" if not self.address else f"address {self.address}"
+            raise RuntimeError(f"no device matched {what} (is it advertising? `svc on ble`)"
+                               + await self._discovery_hint())
         logger.info("connecting to %s [%s]", dev.name, dev.address)
         # macOS can keep a stale bond after a reflash ("Peer removed pairing information"); the
         # failed attempt usually drops the bond, so retry a couple of times.
@@ -247,9 +270,13 @@ class BleTransport(Transport):
                     await client.disconnect()
                 except Exception:
                     pass
-                logger.warning("connect attempt %d failed: %s", attempt, e)
+                # BlueZ raises BleakError('') on some failures, so an empty str(e) would print
+                # "failed: " and say nothing — fall back to the exception type.
+                logger.warning("connect attempt %d failed: %s", attempt, str(e) or type(e).__name__)
                 if attempt == self.connect_retries:
-                    raise RuntimeError(f"could not connect after {attempt} attempts: {last}")
+                    raise RuntimeError(f"could not connect to {dev.name} [{dev.address}] after "
+                                       f"{attempt} attempts: {str(last) or type(last).__name__}"
+                                       + await self._discovery_hint())
                 await asyncio.sleep(1.5)
         try:
             await client.start_notify(self.TX_UUID, self._on_notify)
