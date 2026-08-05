@@ -73,6 +73,11 @@ class PwmState:
 
 
 class FuguDevice:
+    # cached state older than this counts as stale (see telemetry_fresh()). The device
+    # prints its PWM status line about once a second; keep this well above that period
+    # but short enough that a wedged link is caught within one measurement step.
+    telemetry_max_age = 10.0
+
     @staticmethod
     def get_default_serial_port():
         import socket
@@ -83,6 +88,8 @@ class FuguDevice:
         self.wifi_rssi = 0
         self.temperatures = []
         self.voltages = []
+        # monotonic time of the last parsed telemetry line, see telemetry_fresh()
+        self._last_telemetry_t = None
 
         if ip:
             assert transport is None
@@ -125,6 +132,7 @@ class FuguDevice:
     def close(self, close_transport=True, join_rx=True):
         self.is_open = False
         self.pwm_state = PwmState(None, 0, 0, 0)
+        self._last_telemetry_t = None  # a closed device has no current state
         self.console.close()
 
     def _on_line(self, rx: str):
@@ -155,6 +163,7 @@ class FuguDevice:
             self.wifi_rssi = int(d.get('rssi', 0))
             self.temperatures = [float(d.get('tmp_ntc', nan)), float(d.get('tmp_mcu', nan))]
             self.voltages = [float(d.get('vin', nan)), float(d.get('vout', nan))]
+            self._last_telemetry_t = time.monotonic()
 
             if self.pwm_state != s:
                 self.pwm_state = s
@@ -168,6 +177,32 @@ class FuguDevice:
         self.on_message and self.on_message(rx)
 
         logger.debug('  %s  FUGU: %s', self.prefix, rx)
+
+    def telemetry_age(self):
+        """Seconds since the last parsed PWM status line, inf if we never saw one.
+
+        pwm_state/wifi_rssi/temperatures/voltages are only refreshed by that line, so they
+        all freeze at their last value when the link wedges or the reader thread dies.
+        """
+        if self._last_telemetry_t is None:
+            return float('inf')
+        return time.monotonic() - self._last_telemetry_t
+
+    def telemetry_fresh(self, max_age=None):
+        """False if the cached device state is stale (or we never had any).
+
+        Callers that decide something from pwm_state/wifi_rssi/voltages must gate on this,
+        otherwise a dead link reads as 'everything still fine' -- the checks would pass
+        precisely when we've gone blind. Never returns True on a failure to evaluate.
+        """
+        age = self.telemetry_age()
+        if not self.console.is_alive():
+            logger.error(self.prefix + 'reader thread is dead, telemetry is %.1fs old', age)
+            return False
+        if age > (self.telemetry_max_age if max_age is None else max_age):
+            logger.error(self.prefix + 'stale telemetry: last status line %.1fs ago', age)
+            return False
+        return True
 
     def get_uptime(self):
         """Device uptime in seconds (monotonic since boot, resets only on reboot), or None.
