@@ -169,23 +169,32 @@ class BleTransport(Transport):
     NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
     RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # write  (host -> device)
     TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # notify (device -> host)
+    TELE_UUID = "6e400005-b5a3-f393-e0a9-e50e24dcca9e"  # notify (binary telemetry records)
     ATT_CHUNK = 20  # conservative pre-MTU-negotiation ATT payload
 
     def __init__(self, name="fugu", address=None, scan_timeout=10.0, connect_retries=3,
-                 read_timeout=0.3):
+                 read_timeout=0.3, tele_cb=None):
         self.name = name
         self.address = address
         self.scan_timeout = scan_timeout
         self.connect_retries = connect_retries
         self.read_timeout = read_timeout
+        self.tele_cb = tele_cb  # raw-bytes callback for the TELE char (bypasses line assembly)
         self._rx: "queue.Queue[bytes]" = queue.Queue()
         self._buf = b''
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._client = None
 
-    def _submit(self, coro):
-        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+    def _submit(self, coro, timeout=30.0):
+        # Bounded: a GATT op can stall forever (e.g. BlueZ on-demand pairing for an encrypted
+        # char never completing headlessly) — fail fast instead of hanging the caller.
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout)
+
+    # Process-wide: BlueZ races on concurrent scans/connects ("Operation already in progress"),
+    # so every BleTransport open (incl. Console.reconnect) serializes here. Callers doing their
+    # own BleakScanner scans should hold it too.
+    connect_serialize = threading.Lock()
 
     def open(self):
         if self._client is not None:
@@ -193,7 +202,13 @@ class BleTransport(Transport):
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
         self._thread.start()
-        self._submit(self._connect())
+        try:
+            with BleTransport.connect_serialize:
+                # scan (scan_timeout) + connect_retries attempts can far exceed the per-op default
+                self._submit(self._connect(), timeout=self.scan_timeout + self.connect_retries * 35.0)
+        except BaseException:
+            self.close()  # stop/join the orphaned loop+thread; a timed-out _connect must not leak them
+            raise
 
     async def _find_device(self):
         from bleak import BleakScanner
@@ -220,13 +235,18 @@ class BleTransport(Transport):
         # macOS can keep a stale bond after a reflash ("Peer removed pairing information"); the
         # failed attempt usually drops the bond, so retry a couple of times.
         last = None
-        client = BleakClient(dev)
+        client = None
         for attempt in range(1, self.connect_retries + 1):
+            client = BleakClient(dev)  # fresh per attempt: a half-connected client fails re-connect()
             try:
                 await client.connect()
                 break
             except Exception as e:
                 last = e
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
                 logger.warning("connect attempt %d failed: %s", attempt, e)
                 if attempt == self.connect_retries:
                     raise RuntimeError(f"could not connect after {attempt} attempts: {last}")
@@ -236,6 +256,13 @@ class BleTransport(Transport):
         except Exception as e:
             self._explain_cccd_failure(dev, e)
             raise
+        if self.tele_cb is not None:
+            try:
+                await client.start_notify(self.TELE_UUID, lambda _c, d: self.tele_cb(bytes(d)))
+            except Exception as e:
+                raise RuntimeError(
+                    f"telemetry characteristic not available ({e}) — "
+                    "firmware built with CONFIG_FUGU_WITH_BLE_TELE?") from e
         self._client = client
 
     @staticmethod
@@ -339,8 +366,10 @@ class EspHomeBleTransport(Transport):
         self._stop_notify = None
         self._closing = False
 
-    def _submit(self, coro):
-        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+    def _submit(self, coro, timeout=30.0):
+        # Bounded: a GATT op can stall forever (e.g. BlueZ on-demand pairing for an encrypted
+        # char never completing headlessly) — fail fast instead of hanging the caller.
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout)
 
     def open(self):
         if self._api is not None:
@@ -348,7 +377,11 @@ class EspHomeBleTransport(Transport):
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
         self._thread.start()
-        self._submit(self._connect())
+        try:
+            self._submit(self._connect(), timeout=90.0)
+        except BaseException:
+            self.close()  # a timed-out connect must not leak the loop+thread
+            raise
 
     @staticmethod
     def _mac_to_int(mac) -> int:
