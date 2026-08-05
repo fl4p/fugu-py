@@ -249,7 +249,12 @@ class Console:
         self._stop.set()
         try:
             self.transport.close()  # unblocks the reader's transport.read()
-        except Exception:
+        except BaseException:
+            # BaseException: a Ctrl+C escaping here would skip the reader join below, and for the
+            # BLE transport it is exactly the interrupt that leaves the link allocated
             pass
-        if threading.current_thread() is not self._reader:
-            self._reader.join(timeout=2)
+        try:
+            if threading.current_thread() is not self._reader:
+                self._reader.join(timeout=2)
+        except BaseException:
+            pass

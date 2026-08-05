@@ -260,6 +260,13 @@ class BleTransport(Transport):
         last = None
         client = None
         for attempt in range(1, self.connect_retries + 1):
+            if attempt > 1:
+                # BlueZ prunes the device from its object manager shortly after the scan ends (and
+                # after a failed connect), and bleak then raises "device 'dev_XX_..' not found"
+                # without ever going on air — so the retries burn instantly and prove nothing.
+                # Re-scan so each attempt has a live D-Bus object; keep the old dev if the re-scan
+                # comes up empty, so the reported error stays the connect failure, not "not found".
+                dev = await self._find_device() or dev
             client = BleakClient(dev)  # fresh per attempt: a half-connected client fails re-connect()
             try:
                 await client.connect()
@@ -335,16 +342,32 @@ class BleTransport(Transport):
                 self.RX_UUID, data[off:off + self.ATT_CHUNK], response=True))
 
     def close(self):
-        if self._client is not None:
+        try:
+            if self._client is not None:
+                try:
+                    # shorter than the _submit default: close is on the exit path, and a caller
+                    # staring at a 30 s "hang" reaches for Ctrl+C, which used to abort the
+                    # teardown below and leak the loop, the thread and the ACL
+                    self._submit(self._client.disconnect(), timeout=10.0)
+                except BaseException as e:
+                    # warning, not debug: an unconfirmed disconnect means the peripheral may still
+                    # hold its single connection slot until the supervision timeout, and the next
+                    # open() then fails with a bare connect TimeoutError that explains nothing
+                    logger.warning("ble disconnect did not confirm (%s: %s) — the peripheral may "
+                                   "still hold the link", type(e).__name__, str(e) or "-")
+                finally:
+                    self._client = None
+        finally:
+            # runs even when a Ctrl+C lands in the disconnect wait above. The join is itself a
+            # 2 s window, so shield it too — otherwise the interrupt escapes close() and the
+            # loop/thread stay behind after all.
             try:
-                self._submit(self._client.disconnect())
-            except Exception as e:
-                logger.debug("ble disconnect: %s", e)
-            self._client = None
-        if self._loop is not None:
-            self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._thread is not None:
-            self._thread.join(timeout=2)
+                if self._loop is not None:
+                    self._loop.call_soon_threadsafe(self._loop.stop)
+                if self._thread is not None:
+                    self._thread.join(timeout=2)
+            except BaseException as e:
+                logger.warning("ble loop teardown incomplete (%s: %s)", type(e).__name__, str(e) or "-")
 
 
 class EspHomeBleTransport(Transport):
@@ -562,22 +585,33 @@ class EspHomeBleTransport(Transport):
 
     def close(self):
         self._closing = True
-        if self._api is not None:
-            for what, coro in (("stop_notify", self._stop_notify() if self._stop_notify else None),
-                               ("disconnect", self._api.bluetooth_device_disconnect(self._addr_int)
-                                if self._addr_int is not None else None),
-                               ("api", self._api.disconnect())):
-                if coro is None:
-                    continue
-                try:
-                    self._submit(coro)
-                except Exception as e:
-                    logger.debug("ble-proxy %s: %s", what, e)
-            self._api = None
-        if self._loop is not None:
-            self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._thread is not None:
-            self._thread.join(timeout=2)
+        try:
+            if self._api is not None:
+                for what, coro in (("stop_notify", self._stop_notify() if self._stop_notify else None),
+                                   ("disconnect", self._api.bluetooth_device_disconnect(self._addr_int)
+                                    if self._addr_int is not None else None),
+                                   ("api", self._api.disconnect())):
+                    if coro is None:
+                        continue
+                    try:
+                        self._submit(coro, timeout=10.0)
+                    except BaseException as e:
+                        # see BleTransport.close(): an unconfirmed disconnect can leave the
+                        # peripheral's connection slot allocated, so say so
+                        logger.warning("ble-proxy %s did not confirm (%s: %s)",
+                                       what, type(e).__name__, str(e) or "-")
+                self._api = None
+        finally:
+            # runs even when a Ctrl+C lands in one of the waits above (the join is a 2 s window
+            # of its own, so shield that too — see BleTransport.close())
+            try:
+                if self._loop is not None:
+                    self._loop.call_soon_threadsafe(self._loop.stop)
+                if self._thread is not None:
+                    self._thread.join(timeout=2)
+            except BaseException as e:
+                logger.warning("ble-proxy loop teardown incomplete (%s: %s)",
+                               type(e).__name__, str(e) or "-")
 
 
 class MqttTransport(Transport):
