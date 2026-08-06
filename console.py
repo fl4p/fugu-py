@@ -67,7 +67,10 @@ class Console:
         self._reader.start()
 
     def is_alive(self) -> bool:
-        return self._reader.is_alive()
+        # The reader thread outlives a dropped link (BleTransport.read() just returns b'' on
+        # timeout), so a thread-only check reports a hung-up device as alive forever — `while
+        # dev.is_connected()` then spins on stale data until some write raises. Ask the transport.
+        return self._reader.is_alive() and self.transport.is_alive()
 
     def _read_loop(self):
         while not self._stop.is_set():

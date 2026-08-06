@@ -1,5 +1,7 @@
 import asyncio
 import glob
+import logging
+import os
 import queue
 import socket
 import sys
@@ -18,6 +20,11 @@ class Transport(object):
 
     def open(self):
         raise NotImplementedError()
+
+    def is_alive(self) -> bool:
+        """Whether the link is still usable. Transports that cannot tell say True — only a
+        definite NO may be reported, so a transport without liveness never fakes a hang-up."""
+        return True
 
     def read(self) -> bytes:
         raise NotImplementedError()
@@ -172,12 +179,35 @@ class BleTransport(Transport):
     TELE_UUID = "6e400005-b5a3-f393-e0a9-e50e24dcca9e"  # notify (binary telemetry records)
     ATT_CHUNK = 20  # conservative pre-MTU-negotiation ATT payload
 
-    def __init__(self, name="fugu", address=None, scan_timeout=10.0, connect_retries=3,
-                 read_timeout=0.3, tele_cb=None):
+    @staticmethod
+    def is_tele_adv(mfr_data):
+        """WITH_BLE_ADV broadcast (company 0xFFFF, record magic 0xF7). It replaces the whole
+        adv payload, so the NUS UUID is absent while it runs — treat it as a fugu marker."""
+        return (mfr_data.get(0xFFFF) or b"")[:1] == b"\xf7"
+
+    # Retry hard, and don't bother stretching the per-attempt timeout. On a host whose BT radio is
+    # contended (a Pi's on-board controller shares silicon and antenna with wlan0), the peripheral
+    # never receives the CONNECT_IND: the controller still reports LE Connection Complete: Success,
+    # then the link dies ~75 ms later with 0x3e "Connection Failed to be Established", and
+    # bluetoothd sits out ~5 s before it tries again. That fixed backoff — not radio time — is what
+    # makes a connect take 5-17 s. So a 30 s attempt times out as readily as a 10 s one; only
+    # re-issuing helps. `adapter` (below) is the actual cure.
+    def __init__(self, name="fugu", address=None, scan_timeout=10.0, connect_retries=5,
+                 connect_timeout=12.0, read_timeout=0.3, tele_cb=None, adapter=None):
         self.name = name
         self.address = address
+        # BlueZ adapter (hci0/hci1…), $BLE_ADAPTER by default. A Pi's on-board controller shares
+        # silicon and antenna with wlan0, and loses the coexistence arbitration: measured 20/30
+        # connects at 3.2 s median vs 30/30 at 0.4 s on a separate dongle. Only forwarded when
+        # set — the CoreBluetooth/WinRT backends reject the kwarg.
+        # Accepts "hciN" or the adapter's MAC — prefer the MAC: the kernel index follows probe
+        # order and moves (hci1 became hci0 here the moment the on-board radio was disabled),
+        # the address doesn't. Resolved in _connect(), which has the event loop.
+        self.adapter = adapter if adapter is not None else os.environ.get("BLE_ADAPTER")
+        self._adapter_kw = {}
         self.scan_timeout = scan_timeout
         self.connect_retries = connect_retries
+        self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
         self.tele_cb = tele_cb  # raw-bytes callback for the TELE char (bypasses line assembly)
         self._rx: "queue.Queue[bytes]" = queue.Queue()
@@ -205,15 +235,58 @@ class BleTransport(Transport):
         try:
             with BleTransport.connect_serialize:
                 # scan (scan_timeout) + connect_retries attempts can far exceed the per-op default
-                self._submit(self._connect(), timeout=self.scan_timeout + self.connect_retries * 35.0)
+                self._submit(self._connect(),
+                             timeout=self.scan_timeout
+                                     + self.connect_retries * (self.connect_timeout + 5.0)
+                                     + 15.0)  # _discovery_hint() rescans on the final failure
         except BaseException:
             self.close()  # stop/join the orphaned loop+thread; a timed-out _connect must not leak them
             raise
 
+    async def _resolve_adapter(self):
+        """Turn self.adapter into the {"adapter": "hciN"} kwarg bleak wants.
+
+        "hciN" and empty pass straight through; anything containing ':' is treated as an adapter
+        MAC and looked up over BlueZ's D-Bus ObjectManager. A MAC that matches no present adapter
+        raises — silently falling back to the default adapter would quietly restore the very
+        contention the caller asked to avoid, and look like it worked.
+        """
+        spec = self.adapter
+        if not spec or ":" not in spec:
+            self._adapter_kw = {"adapter": spec} if spec else {}
+            return
+        try:
+            from dbus_fast.aio import MessageBus
+            from dbus_fast.constants import BusType
+        except ImportError as e:
+            raise RuntimeError(
+                f"adapter={spec!r} looks like a MAC, but adapter selection by address needs "
+                "BlueZ/D-Bus (Linux only). Drop the option, or pass an 'hciN' name.") from e
+        want = spec.lower()
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        try:
+            intro = await bus.introspect("org.bluez", "/")
+            mgr = bus.get_proxy_object("org.bluez", "/", intro) \
+                .get_interface("org.freedesktop.DBus.ObjectManager")
+            found = {}
+            for path, ifaces in (await mgr.call_get_managed_objects()).items():
+                ad = ifaces.get("org.bluez.Adapter1")
+                if ad and "Address" in ad:
+                    found[ad["Address"].value.lower()] = path.rsplit("/", 1)[-1]
+        finally:
+            bus.disconnect()
+        if want not in found:
+            raise RuntimeError(
+                f"no BlueZ adapter with address {spec} (present: "
+                + ", ".join(f"{h}={m}" for m, h in sorted(found.items())) + ")")
+        self._adapter_kw = {"adapter": found[want]}
+        logger.debug("adapter %s -> %s", spec, found[want])
+
     async def _find_device(self):
         from bleak import BleakScanner
         if self.address:
-            return await BleakScanner.find_device_by_address(self.address, timeout=self.scan_timeout)
+            return await BleakScanner.find_device_by_address(self.address, timeout=self.scan_timeout,
+                                                            **self._adapter_kw)
         name = (self.name or "").lower()
 
         def match(d, adv):
@@ -224,7 +297,8 @@ class BleTransport(Transport):
                 return name in (d.name or "").lower()
             return has_nus
 
-        return await BleakScanner.find_device_by_filter(match, timeout=self.scan_timeout)
+        return await BleakScanner.find_device_by_filter(match, timeout=self.scan_timeout,
+                                                       **self._adapter_kw)
 
     async def _discovery_hint(self):
         """`--name`/`--address` missed, or the connect failed: say what IS in range.
@@ -235,13 +309,15 @@ class BleTransport(Transport):
         """
         try:
             from bleak import BleakScanner
-            found = await BleakScanner.discover(timeout=min(self.scan_timeout, 8.0), return_adv=True)
+            found = await BleakScanner.discover(timeout=min(self.scan_timeout, 8.0), return_adv=True,
+                                                **self._adapter_kw)
         except Exception as e:
             return f" (discovery failed: {e})"
         seen = []
         for d, adv in found.values():
             nm = d.name or ""
-            if "fugu" in nm.lower() or self.NUS_SERVICE in (s.lower() for s in (adv.service_uuids or [])):
+            if "fugu" in nm.lower() or self.NUS_SERVICE in (s.lower() for s in (adv.service_uuids or [])) \
+                    or self.is_tele_adv(adv.manufacturer_data):
                 seen.append(f"{nm or '?'} [{d.address}] rssi {adv.rssi}")
         if not seen:
             return " (no fugu/NUS devices advertising at all)"
@@ -249,6 +325,7 @@ class BleTransport(Transport):
 
     async def _connect(self):
         from bleak import BleakClient
+        await self._resolve_adapter()
         dev = await self._find_device()
         if dev is None:
             what = f"name~{self.name!r}" if not self.address else f"address {self.address}"
@@ -267,9 +344,9 @@ class BleTransport(Transport):
                 # Re-scan so each attempt has a live D-Bus object; keep the old dev if the re-scan
                 # comes up empty, so the reported error stays the connect failure, not "not found".
                 dev = await self._find_device() or dev
-            client = BleakClient(dev)  # fresh per attempt: a half-connected client fails re-connect()
+            client = BleakClient(dev, **self._adapter_kw)  # fresh per attempt: a half-connected client fails re-connect()
             try:
-                await client.connect()
+                await client.connect(timeout=self.connect_timeout)
                 break
             except Exception as e:
                 last = e
@@ -279,7 +356,11 @@ class BleTransport(Transport):
                     pass
                 # BlueZ raises BleakError('') on some failures, so an empty str(e) would print
                 # "failed: " and say nothing — fall back to the exception type.
-                logger.warning("connect attempt %d failed: %s", attempt, str(e) or type(e).__name__)
+                # A stalled first attempt is routine on a scanning BlueZ host; only nag once the
+                # retries start looking like a real failure.
+                logger.log(logging.INFO if attempt < 3 else logging.WARNING,
+                           "connect attempt %d/%d failed: %s",
+                           attempt, self.connect_retries, str(e) or type(e).__name__)
                 if attempt == self.connect_retries:
                     raise RuntimeError(f"could not connect to {dev.name} [{dev.address}] after "
                                        f"{attempt} attempts: {str(last) or type(last).__name__}"
@@ -319,6 +400,9 @@ class BleTransport(Transport):
     def _on_notify(self, _char, data: bytearray):
         self._rx.put(bytes(data))
 
+    def is_alive(self) -> bool:
+        return self._client is not None and self._client.is_connected
+
     def read(self) -> bytes:
         deadline = time.time() + self.read_timeout
         while True:
@@ -335,6 +419,11 @@ class BleTransport(Transport):
                 return b''
 
     def write(self, data: bytes):
+        # A dropped link clears bleak's service cache, so the write would surface as the very
+        # confusing "Service Discovery has not been performed yet" — name the real fault instead.
+        if not self.is_alive():
+            raise ConnectionError(f"BLE link to {self.name or self.address} is down "
+                                  "(peer disconnected) — reopen the transport")
         # write-with-response: the RX char requires an encrypted write under
         # ble_security=justworks|passkey, and some stacks drop write-without-response there.
         for off in range(0, len(data), self.ATT_CHUNK):
@@ -439,12 +528,13 @@ class EspHomeBleTransport(Transport):
 
     @staticmethod
     def _parse_adv(data: bytes):
-        """Parse BLE AD structures → (local_name, [128-bit-uuid-str, …]).
+        """Parse BLE AD structures → (local_name, [128-bit-uuid-str, …], {company: mfr_bytes}).
 
         Modern ESPHome proxies forward raw advertisement bytes; pull out the local name (AD types
-        0x08/0x09) and the 128-bit service-UUID lists (0x06/0x07) so name/NUS matching still works.
+        0x08/0x09), the 128-bit service-UUID lists (0x06/0x07) and manufacturer data (0xFF) so
+        name/NUS/telemetry-adv matching still works.
         """
-        name, uuids = "", []
+        name, uuids, mfr = "", [], {}
         i, n = 0, len(data)
         while i + 1 < n:
             ln = data[i]
@@ -457,8 +547,10 @@ class EspHomeBleTransport(Transport):
                 for off in range(0, len(val) - 15, 16):
                     h = val[off:off + 16][::-1].hex()
                     uuids.append(f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}")
+            elif typ == 0xFF and len(val) >= 2:
+                mfr[int.from_bytes(val[:2], "little")] = bytes(val[2:])
             i += 1 + ln
-        return name, uuids
+        return name, uuids, mfr
 
     async def _scan(self):
         """Scan the proxy's raw advertisements; return (address, address_type, name)."""
@@ -470,8 +562,8 @@ class EspHomeBleTransport(Transport):
             if found.done():
                 return
             for a in resp.advertisements:
-                name, uuids = self._parse_adv(bytes(a.data))
-                has_nus = self.NUS_SERVICE in uuids
+                name, uuids, mfr = self._parse_adv(bytes(a.data))
+                has_nus = self.NUS_SERVICE in uuids or BleTransport.is_tele_adv(mfr)
                 ok = (want in name.lower()) if want else has_nus
                 if ok:
                     found.set_result((a.address, a.address_type, name))
