@@ -83,8 +83,15 @@ class FuguDevice:
         import socket
         return '/dev/ttyACM1' if socket.gethostname() == 'rpi' else '/dev/cu.usbmodem*'
 
+    _warned_set_d = False
+
     def __init__(self, transport: Transport = None, ip=None, prefix='', block=True):
         self.pwm_state = PwmState(None, 0, 0, 0)
+        # PWM resolution of the active gate driver (ledc: 2047, mcpwm: ~4103), queried
+        # lazily from the device (see query_pwm_limits). Raw `dc` counts scale with it.
+        self._pwm_max = None
+        self._pwm_ctrl_max = None  # the `dc` clamp limit (pwmMax - pwmRectMin)
+        self.pwm_freq = None
         self.wifi_rssi = 0
         self.temperatures = []
         self.voltages = []
@@ -133,6 +140,7 @@ class FuguDevice:
         self.is_open = False
         self.pwm_state = PwmState(None, 0, 0, 0)
         self._last_telemetry_t = None  # a closed device has no current state
+        self._pwm_max = self._pwm_ctrl_max = None
         self.console.close()
 
     def _on_line(self, rx: str):
@@ -246,6 +254,8 @@ class FuguDevice:
         if up is not None:
             if self._last_uptime is not None and up < self._last_uptime:
                 self._rebooted = True
+                # a reboot may have switched the gate driver (ledc<->mcpwm) -> re-query
+                self._pwm_max = self._pwm_ctrl_max = None
                 logger.warning(self.prefix + 'reboot detected (uptime %ds -> %ds)', self._last_uptime, up)
             self._last_uptime = up
         rebooted = self._rebooted
@@ -288,8 +298,55 @@ class FuguDevice:
         else:
             self.write("mppt\n")
 
-    def set_D(self, pwm_cnt, step_wait=0.05):
-        max_step = 10
+    # --- pwm ------------------------------------------------------------------------------------
+
+    @property
+    def pwm_max(self) -> int:
+        """PWM resolution of the active gate driver, queried once from the device."""
+        if self._pwm_max is None:
+            self.query_pwm_limits()
+        if self._pwm_max is None:
+            raise RuntimeError('device did not report pwmMax (pwm-dump unsupported?), '
+                               'cannot convert duty ratios; use set_pwm() with raw counts')
+        return self._pwm_max
+
+    @property
+    def pwm_ctrl_max(self) -> Optional[int]:
+        if self._pwm_ctrl_max is None and self._pwm_max is None:
+            self.query_pwm_limits()
+        return self._pwm_ctrl_max
+
+    def query_pwm_limits(self):
+        """Populate pwm_max/pwm_freq from `pwm-dump` and pwm_ctrl_max (the `dc` clamp
+        limit) from an out-of-range `dc` probe. Raises if neither yields anything --
+        never silently assumes a resolution."""
+        try:
+            for l in self.query('pwm-dump'):
+                if m := re.search(r'freq=(\d+) pwmMax=(\d+)', l):
+                    self.pwm_freq = int(m.group(1))
+                    self._pwm_max = int(m.group(2))
+        except Exception as e:
+            logger.warning(self.prefix + 'pwm-dump failed (%s), probing dc limit', e)
+        # rejected before any mode/duty change, so this has no side effect
+        for l in self.console.command('dc 999999999'):
+            if m := re.search(r'out of range \[0,(\d+)\]', l):
+                self._pwm_ctrl_max = int(m.group(1))
+        # the clamp limit is mandatory: without it set_duty() could send counts the
+        # firmware silently rejects (never degrade to an unverified state)
+        if self._pwm_ctrl_max is None:
+            had_max = self._pwm_max is not None
+            self._pwm_max = None
+            raise RuntimeError('cannot determine PWM limits (dc probe failed%s)'
+                               % ('' if had_max else ', pwm-dump too'))
+        logger.debug(self.prefix + 'pwm limits: pwm_max=%s pwm_ctrl_max=%s freq=%s',
+                     self._pwm_max, self._pwm_ctrl_max, self.pwm_freq)
+
+    def set_pwm(self, pwm_cnt, step_wait=0.05) -> int:
+        """Set raw HS on-count (`dc` units, driver-resolution dependent), ramping in steps.
+        Returns the count sent."""
+        pwm_cnt = int(pwm_cnt)
+        # ~0.5% of range per step, same fade rate as the tuned 10/2048
+        max_step = max(10, round(self._pwm_max * 10 / 2048)) if self._pwm_max else 10
 
         pwm_ctrl = self.pwm_state.pwm_ctrl
 
@@ -302,10 +359,28 @@ class FuguDevice:
             self.transport.write(b'dc %d\n' % pwm_ctrl)
             time.sleep(step_wait / 4 if delta < 0 else step_wait)
 
-        # TODO wait?
-
-        # self.transport.send(b'dc %d\n' % pwm_cnt)
         logger.debug('Set pwm_cnt = %d', pwm_cnt)
+        return pwm_cnt
+
+    def set_D(self, pwm_cnt, step_wait=0.05) -> int:
+        # deprecated: the name suggests a duty ratio but the unit is raw counts
+        if not FuguDevice._warned_set_d:
+            FuguDevice._warned_set_d = True
+            logger.warning('set_D() is deprecated, use set_pwm() (raw counts) or set_duty() (0..1)')
+        return self.set_pwm(pwm_cnt, step_wait)
+
+    def set_duty(self, d: float, step_wait=0.05) -> int:
+        """Set duty ratio 0..1, converted with the device-reported resolution.
+        Returns the raw count sent (compare pwm_state.pwm_ctrl against this)."""
+        assert 0 <= d <= 1, d
+        cnt = round(d * self.pwm_max)
+        if cnt > self._pwm_ctrl_max:  # always known when pwm_max is (see query_pwm_limits)
+            logger.warning(self.prefix + 'duty %.3f clamped to pwm_ctrl_max=%d', d, self._pwm_ctrl_max)
+            cnt = self._pwm_ctrl_max
+        return self.set_pwm(cnt, step_wait)
+
+    def get_duty(self) -> float:
+        return self.pwm_state.pwm_ctrl / self.pwm_max
 
     def wifi_power(self, on, minutes=None):
         # not acked: turning Wi-Fi off drops telnet/BLE, so an OK marker may never arrive.
@@ -476,33 +551,31 @@ class FuguDevice:
         return self.command_ack('svc %s %s' % (action, name))
 
     def __iadd__(self, i):
-        self.set_D(self.pwm_state.pwm_ctrl + i)
+        self.set_pwm(self.pwm_state.pwm_ctrl + i)
         return self
 
     def is_connected(self):
         return self.console.is_alive()
 
-    def power_loop_rig_sequence_buck(dev, target_d=770):
+    def power_loop_rig_sequence_buck(dev, target_duty=0.376):
         dev.wifi_power(False)
 
         dev.manual_pwm()
         dev.sync_rect_enable(True)  # before shutdown sequence, make sure to disable forced PWM
-        dev.set_D(1)
+        dev.set_pwm(1)  # minimum on-time, intentionally a raw count
         dev.sync_rect_enable(False)
         dev.ideal_diode_enable(False)
-        while dev.voltages[0] > 80 or dev.voltages[0] < 70:
-            print(self.prefix, 'waiting for input voltage to converge', dev.voltages)
+        while dev.voltages[0] > 80 or dev.voltages[0] < 68:
+            print(dev.prefix, 'waiting for input voltage to converge', dev.voltages)
             time.sleep(1)
 
-        dev.set_D(400)
+        dev.set_duty(0.195)
         dev.sync_rect_enable(True)
         dev.ideal_diode_enable(True)
         time.sleep(1)
-        dev.set_D(600)
+        dev.set_duty(0.293)
         time.sleep(.2)
-        # dev.set_D(700)
-        # time.sleep(1)
-        dev.set_D(target_d, step_wait=0.15)
+        dev.set_duty(target_duty, step_wait=0.15)
         dev.sync_rect_enable('forced')
 
 
@@ -513,11 +586,11 @@ if __name__ == '__main__':
 
     sys.exit(0)
 
-    pwm_cnt = 300
+    duty = 0.146
     while True:
-        dev.set_D(pwm_cnt)
+        dev.set_duty(duty)
         time.sleep(.2)
 
-        if pwm_cnt == 1500:
+        if duty == 0.732:
             break
-        pwm_cnt = min(pwm_cnt * 1.1, 1500)
+        duty = min(duty * 1.1, 0.732)
