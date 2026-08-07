@@ -711,7 +711,7 @@ class FuguDevice:
     def is_connected(self):
         return self.console.is_alive()
 
-    def power_loop_rig_sequence_buck(dev, target_duty=0.376):
+    def power_loop_rig_sequence_buck(dev, target_duty=0.4):
         dev.wifi_power(False)
 
         dev.manual_pwm()
@@ -726,7 +726,7 @@ class FuguDevice:
         dev.set_duty(0.195)
         dev.sync_rect_enable(True)
         dev.ideal_diode_enable(True)
-        time.sleep(1)
+        time.sleep(.4)
         dev.set_duty(0.293)
         time.sleep(.2)
         dev.set_duty(target_duty, step_wait=0.15)
