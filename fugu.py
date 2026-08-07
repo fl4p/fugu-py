@@ -529,6 +529,95 @@ class FuguDevice:
         """Full per-sensor dump as raw text."""
         return self.query('sensor').text
 
+    # --- wired sync ----------------------------------------------------------------------------
+
+    def wsync_edge_rate(self) -> Optional[float]:
+        """Edge rate on the wired-sync pin (`board.conf::pwm_sync_pin`) in Hz, from the `wsync`
+        PCNT diagnostic. On a follower that is the leader's incoming pulse, on a leader its own
+        outgoing one.
+
+        None means *not measured* (sync_role=none, firmware built without WSYNC, saturated
+        count, command rejected) -- distinct from 0.0, which means the counter ran and the pin
+        was silent."""
+        try:
+            reply = self.query('wsync')
+        except Exception as e:
+            logger.warning(self.prefix + 'wsync failed: %s', e)
+            return None
+        for l in reply:
+            if 'no edge counter' in l:
+                return None
+            if m := re.search(r'wsync edges:\s*(\d+)\s+in\s+(\d+)\s*ms', l):
+                n, ms = int(m.group(1)), int(m.group(2))
+                return n * 1000.0 / ms if ms else None
+        return None
+
+    def wsync_status(self, tol=0.05) -> dict:
+        """Wired-sync health of *this* device as
+        {synced, role, rate_hz, expected_hz, reason}.
+
+        `synced` is tri-state and never guesses in favour of health:
+          True  -- role is `follower` and the sync pin carries the leader's pulse at this
+                   converter's own pwm_freq (within `tol`, default 5%).
+          False -- the pin is measurably wrong: no edges, or a rate that isn't pwm_freq
+                   (leader off, wire broken, mismatched pwm_freq).
+          None  -- could not be evaluated: role unknown or not `follower`, no pwm_freq, no edge
+                   counter, command failed. `reason` says which.
+
+        Caveat: this proves the leader's pulse arrives at the expected rate, which is what the
+        follower's MCPWM timer hardware-reloads on -- it does not read back the timer phase. A
+        confirmed lock (switch nodes stationary, no beat) still needs a scope."""
+        out: dict = dict(synced=None, role=None, rate_hz=None, expected_hz=None, reason='')
+
+        try:
+            # absent key reads back as '', i.e. the firmware default
+            out['role'] = self.get_conf_value('converter.conf', 'sync_role') or 'none'
+        except Exception as e:
+            out['reason'] = 'sync_role unreadable: %s' % e
+            return out
+        if out['role'] != 'follower':
+            out['reason'] = 'sync_role=%s, not a follower' % out['role']
+            return out
+
+        expected = self.pwm_freq
+        if expected is None:
+            try:
+                self.query_pwm_limits()
+                expected = self.pwm_freq
+            except Exception as e:
+                logger.warning(self.prefix + 'pwm limits unavailable: %s', e)
+        if expected is None:
+            try:
+                expected = float(self.get_conf_value('converter.conf', 'pwm_freq') or 0) or None
+            except Exception:
+                expected = None
+        if not expected:
+            out['reason'] = 'pwm_freq unknown, cannot judge the edge rate'
+            return out
+        out['expected_hz'] = float(expected)
+
+        rate = self.wsync_edge_rate()
+        out['rate_hz'] = rate
+        if rate is None:
+            out['reason'] = 'no edge count (WSYNC off, or the diagnostic failed)'
+            return out
+
+        # the measurement window is a vTaskDelay (1 ms tick) that a busy device can overrun, so
+        # the rate reads low under load; tol covers that, not a real frequency offset
+        dev = (rate - expected) / expected
+        out['synced'] = abs(dev) <= tol
+        if out['synced']:
+            out['reason'] = 'sync pulse at %.0f Hz (pwm_freq %.0f, %+.1f%%)' % (rate, expected, 100 * dev)
+        elif rate == 0:
+            out['reason'] = 'no sync pulse on the wire'
+        else:
+            out['reason'] = 'edge rate %.0f Hz != pwm_freq %.0f Hz (%+.1f%%)' % (rate, expected, 100 * dev)
+        return out
+
+    def wsync_synced(self, tol=0.05) -> Optional[bool]:
+        """Tri-state shorthand for wsync_status()['synced'] -- None = could not verify."""
+        return self.wsync_status(tol)['synced']
+
     # --- services ------------------------------------------------------------------------------
 
     def svc_list(self):
