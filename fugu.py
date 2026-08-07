@@ -85,7 +85,8 @@ class FuguDevice:
 
     _warned_set_d = False
 
-    def __init__(self, transport: Transport = None, ip=None, prefix='', block=True):
+    def __init__(self, transport: Transport = None, ip=None, prefix='', block=True,
+                 block_timeout=30.0):
         self.pwm_state = PwmState(None, 0, 0, 0)
         # PWM resolution of the active gate driver (ledc: 2047, mcpwm: ~4103), queried
         # lazily from the device (see query_pwm_limits). Raw `dc` counts scale with it.
@@ -123,17 +124,39 @@ class FuguDevice:
         self.console = Console(transport, eol='\n', on_line=self._on_line)
 
         if block:
-            while self.pwm_state.ccm is None:
-                time.sleep(0.1)
+            try:
+                self.wait_for_pwm_state(timeout=block_timeout)
+            except BaseException:
+                # the console owns a reader thread and the transport; without this an
+                # __init__ that raises (or a Ctrl+C in the wait) leaks both, and the next
+                # connect attempt fails on the still-allocated link
+                self.console.close()
+                raise
 
     def open(self):
         assert not self.is_open
         raise NotImplementedError()
 
-    def wait_for_pwm_state(self):
+    def wait_for_pwm_state(self, timeout=30.0):
+        """Block until the first status line has been parsed.
+
+        Times out rather than waiting forever: a device that is powered but not printing a
+        parseable status line (wrong baud, a firmware that never starts the converter, a BLE
+        link that connected but delivers nothing) would otherwise hang here with no exception
+        ever reaching the caller's unwind -- so the converter is never brought down.
+        """
         assert self.console.is_alive()
         self.pwm_state = PwmState(None, 0, 0, 0)
+        t0 = time.monotonic()
         while self.pwm_state.ccm is None:
+            if timeout is not None and time.monotonic() - t0 > timeout:
+                raise TimeoutError(
+                    '%sno parseable status line after %.0fs -- device silent or not printing '
+                    'telemetry (last lines: %s)'
+                    % (self.prefix, timeout, list(self.ser_tail)[-3:] or 'none'))
+            if not self.console.is_alive():
+                raise ConnectionError(self.prefix + 'reader thread died while waiting for '
+                                                    'the first status line')
             time.sleep(0.1)
 
     def close(self, close_transport=True, join_rx=True):
@@ -454,6 +477,48 @@ class FuguDevice:
 
     def set_ibat_lim(self, amps: float):
         self.command_ack('iset %g' % amps)
+
+    def set_vout(self, volts: float, tol_v=0.5, timeout=20.0, hold=1.0, poll=0.25):
+        """Set the output-voltage setpoint and WAIT until the measured Vout actually holds it.
+
+        Uses the firmware's own regulator (`vset` -> charger Vbat_max). Do NOT drive output
+        voltage by stepping duty from the host: a console round trip is orders of magnitude
+        slower than the converter's control loop, and a host loop fights the regulator it is
+        trying to help.
+
+        Returns the measured Vout. Raises rather than returning a voltage it did not see:
+
+        * TimeoutError if Vout never enters the band, or does not stay in it for `hold`
+          seconds -- reported WITH the measured value, so the caller can tell "regulator is
+          still ramping" from "this setpoint is unreachable".
+        * ConnectionError if telemetry goes stale, because a frozen `voltages` reads as a
+          perfectly settled rail exactly when we have gone blind. Absence of evidence must
+          not encode a settled output.
+
+        `tol_v` is the acceptance band, not a controller gain -- nothing here regulates.
+        """
+        self.set_vbat_max(volts)
+        t0 = time.monotonic()
+        in_band_since = None
+        last = nan
+        while time.monotonic() - t0 < timeout:
+            if not self.telemetry_fresh():
+                raise ConnectionError(
+                    '%sset_vout(%.3f): telemetry went stale (%.1fs old) -- the measured output '
+                    'is unknown, not settled' % (self.prefix, volts, self.telemetry_age()))
+            last = self.voltages[1] if len(self.voltages) > 1 else nan
+            if last == last and abs(last - volts) <= tol_v:
+                in_band_since = in_band_since or time.monotonic()
+                if time.monotonic() - in_band_since >= hold:
+                    logger.debug(self.prefix + 'set_vout(%.3f) -> %.3fV', volts, last)
+                    return last
+            else:
+                in_band_since = None      # must hold, not just touch: overshoot is not settled
+            time.sleep(poll)
+        raise TimeoutError(
+            '%sset_vout(%.3f): Vout=%.3fV after %.0fs, outside +/-%.3fV%s'
+            % (self.prefix, volts, last, timeout, tol_v,
+               ' (reached the band but never held it)' if in_band_since else ''))
 
     # --- misc actuators ------------------------------------------------------------------------
 
