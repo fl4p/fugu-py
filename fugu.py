@@ -496,29 +496,48 @@ class FuguDevice:
           not encode a settled output.
 
         `tol_v` is the acceptance band, not a controller gain -- nothing here regulates.
+
+        Precondition: the converter must NOT be in manual PWM (`dc N`, which is where
+        power_loop_rig_sequence_buck and manual_pwm() leave it). The firmware runs
+        updateManual() there, which only ramps duty toward the manual target -- the CV
+        controller `vset` feeds never executes, so this can only ever time out. Call `mppt`
+        first. There is no console query for the mode, so this is not enforced here.
         """
         self.set_vbat_max(volts)
         t0 = time.monotonic()
         in_band_since = None
+        samples_in_band = 0
+        seen_sample_t = None
         last = nan
         while time.monotonic() - t0 < timeout:
             if not self.telemetry_fresh():
                 raise ConnectionError(
                     '%sset_vout(%.3f): telemetry went stale (%.1fs old) -- the measured output '
                     'is unknown, not settled' % (self.prefix, volts, self.telemetry_age()))
+            # poll (0.25s) is faster than the device's ~1 Hz status line, so track which
+            # readings are actually NEW: re-reading one frozen sample for `hold` seconds is not
+            # evidence of a settled rail, and telemetry_fresh() only trips after 10s
+            fresh_sample = self._last_telemetry_t != seen_sample_t
+            seen_sample_t = self._last_telemetry_t
             last = self.voltages[1] if len(self.voltages) > 1 else nan
             if last == last and abs(last - volts) <= tol_v:
-                in_band_since = in_band_since or time.monotonic()
-                if time.monotonic() - in_band_since >= hold:
-                    logger.debug(self.prefix + 'set_vout(%.3f) -> %.3fV', volts, last)
+                if in_band_since is None:
+                    in_band_since, samples_in_band = time.monotonic(), 1
+                elif fresh_sample:
+                    samples_in_band += 1
+                if time.monotonic() - in_band_since >= hold and samples_in_band >= 2:
+                    logger.debug(self.prefix + 'set_vout(%.3f) -> %.3fV (%d samples)',
+                                 volts, last, samples_in_band)
                     return last
             else:
-                in_band_since = None      # must hold, not just touch: overshoot is not settled
+                # must hold, not just touch: overshoot is not settled
+                in_band_since, samples_in_band = None, 0
             time.sleep(poll)
         raise TimeoutError(
             '%sset_vout(%.3f): Vout=%.3fV after %.0fs, outside +/-%.3fV%s'
             % (self.prefix, volts, last, timeout, tol_v,
-               ' (reached the band but never held it)' if in_band_since else ''))
+               ' (reached the band but never held it over %d fresh samples)' % samples_in_band
+               if in_band_since else ''))
 
     # --- misc actuators ------------------------------------------------------------------------
 
@@ -596,26 +615,39 @@ class FuguDevice:
 
     # --- wired sync ----------------------------------------------------------------------------
 
+    def _wsync_probe(self):
+        """One `wsync` call -> (role, rate_hz). Either element is None when that fact was not
+        established, and neither ever falls back to a guess.
+
+        `role` is the RUNNING role as the gate driver has it, from the firmware's `wsync role=`
+        line -- not `converter.conf::sync_role`, which is read once at boot and can be edited
+        live. Firmware predating that line yields None, i.e. unverified, because a leader counts
+        its own outgoing pulse at exactly pwm_freq and is otherwise indistinguishable from a
+        locked follower."""
+        try:
+            reply = self.query('wsync')
+        except Exception as e:
+            logger.warning(self.prefix + 'wsync failed: %s', e)
+            return None, None
+        role = rate = None
+        for l in reply:
+            if 'no edge counter' in l:
+                return 'none', None
+            if m := re.search(r'wsync role=(\w+)', l):
+                role = m.group(1)
+            if m := re.search(r'wsync edges:\s*(\d+)\s+in\s+(\d+)\s*ms', l):
+                n, ms = int(m.group(1)), int(m.group(2))
+                rate = n * 1000.0 / ms if ms else None
+        return role, rate
+
     def wsync_edge_rate(self) -> Optional[float]:
         """Edge rate on the wired-sync pin (`board.conf::pwm_sync_pin`) in Hz, from the `wsync`
         PCNT diagnostic. On a follower that is the leader's incoming pulse, on a leader its own
         outgoing one.
 
-        None means *not measured* (sync_role=none, firmware built without WSYNC, saturated
-        count, command rejected) -- distinct from 0.0, which means the counter ran and the pin
-        was silent."""
-        try:
-            reply = self.query('wsync')
-        except Exception as e:
-            logger.warning(self.prefix + 'wsync failed: %s', e)
-            return None
-        for l in reply:
-            if 'no edge counter' in l:
-                return None
-            if m := re.search(r'wsync edges:\s*(\d+)\s+in\s+(\d+)\s*ms', l):
-                n, ms = int(m.group(1)), int(m.group(2))
-                return n * 1000.0 / ms if ms else None
-        return None
+        None means *not measured* (sync_role=none, firmware built without WSYNC, command
+        rejected) -- distinct from 0.0, which means the counter ran and the pin was silent."""
+        return self._wsync_probe()[1]
 
     def wsync_status(self, tol=0.05) -> dict:
         """Wired-sync health of *this* device as
@@ -626,22 +658,23 @@ class FuguDevice:
                    converter's own pwm_freq (within `tol`, default 5%).
           False -- the pin is measurably wrong: no edges, or a rate that isn't pwm_freq
                    (leader off, wire broken, mismatched pwm_freq).
-          None  -- could not be evaluated: role unknown or not `follower`, no pwm_freq, no edge
-                   counter, command failed. `reason` says which.
+          None  -- could not be evaluated: role not reported (firmware too old) or not
+                   `follower`, no pwm_freq, no edge counter, command failed. `reason` says which.
 
         Caveat: this proves the leader's pulse arrives at the expected rate, which is what the
         follower's MCPWM timer hardware-reloads on -- it does not read back the timer phase. A
         confirmed lock (switch nodes stationary, no beat) still needs a scope."""
         out: dict = dict(synced=None, role=None, rate_hz=None, expected_hz=None, reason='')
 
-        try:
-            # absent key reads back as '', i.e. the firmware default
-            out['role'] = self.get_conf_value('converter.conf', 'sync_role') or 'none'
-        except Exception as e:
-            out['reason'] = 'sync_role unreadable: %s' % e
+        role, rate = self._wsync_probe()
+        out['role'], out['rate_hz'] = role, rate
+        if role is None:
+            out['reason'] = ('device did not report its wired-sync role -- firmware predates '
+                             '`wsync role=`, so a leader counting its own pulse cannot be told '
+                             'from a synced follower')
             return out
-        if out['role'] != 'follower':
-            out['reason'] = 'sync_role=%s, not a follower' % out['role']
+        if role != 'follower':
+            out['reason'] = 'running role is %s, not a follower' % role
             return out
 
         expected = self.pwm_freq
@@ -652,8 +685,8 @@ class FuguDevice:
             except Exception as e:
                 logger.warning(self.prefix + 'pwm limits unavailable: %s', e)
         if expected is None:
-            try:
-                expected = float(self.get_conf_value('converter.conf', 'pwm_freq') or 0) or None
+            try:  # pwm_freq lives in board.conf, not converter.conf
+                expected = float(self.get_conf_value('board.conf', 'pwm_freq') or 0) or None
             except Exception:
                 expected = None
         if not expected:
@@ -661,14 +694,12 @@ class FuguDevice:
             return out
         out['expected_hz'] = float(expected)
 
-        rate = self.wsync_edge_rate()
-        out['rate_hz'] = rate
         if rate is None:
-            out['reason'] = 'no edge count (WSYNC off, or the diagnostic failed)'
+            out['reason'] = 'no edge count (the diagnostic failed)'
             return out
 
-        # the measurement window is a vTaskDelay (1 ms tick) that a busy device can overrun, so
-        # the rate reads low under load; tol covers that, not a real frequency offset
+        # tol covers the device-side measurement window: the firmware divides by the elapsed
+        # time it measures, so what is left is tick quantization, not a real frequency offset
         dev = (rate - expected) / expected
         out['synced'] = abs(dev) <= tol
         if out['synced']:
