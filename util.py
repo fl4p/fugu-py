@@ -66,10 +66,28 @@ def round_to_n_dec(x, n):
         return num2str(x, n)
 
 
-def sleep_confirm_interrupt(seconds, num=3, poll=None) -> bool:
+def sleep_confirm_interrupt(seconds, num=3, poll=None, burst_s=5) -> bool:
+    """Sleep, polling once a second, and cancel only on `num` interrupts in quick succession.
+
+    Deliberately hard to interrupt: this is what runs while a converter is at power, and a
+    stray Ctrl+C must not drop the run on a path that skips the ramp-down.
+
+    `num` means what it says -- 3 presses within `burst_s` of EACH OTHER. It previously took
+    four, because the elapsed time was measured from the start of the dwell rather than from
+    the previous press: the first interrupt into a 60 s dwell had st >= 5, so `st < 5 and
+    (num := num - 1)` short-circuited before the walrus, the counter never decremented, and
+    that press was silently discarded. The printed countdown was off by one for the same
+    reason. Measured 2026-08-08: bursts of three never cancelled, five did.
+
+    Waiting longer than `burst_s` now genuinely resets the count (the old TODO), so an
+    accidental press minutes earlier cannot combine with two deliberate ones later.
+    """
     import tqdm
     t_start = time.time()
-    with tqdm.tqdm(total=seconds, desc='measurement ..') as pbar:
+    remaining = num
+    last_press = None
+    t0 = t_start
+    with tqdm.tqdm(total=seconds, desc='measurement ..', position=1, leave=False) as pbar:
         while seconds > 0:
             try:
                 t0 = time.time()
@@ -82,12 +100,14 @@ def sleep_confirm_interrupt(seconds, num=3, poll=None) -> bool:
                     pbar.update(int(passed) - pbar.n)
                 break
             except KeyboardInterrupt:
-                st = time.time() - t0
-                # TODO fix this, num should reset to original num after 5s
-                if st < 5 and (num := num - 1) <= 0:
+                now = time.time()
+                if last_press is None or (now - last_press) >= burst_s:
+                    remaining = num          # a new burst, this press is its first
+                remaining -= 1
+                last_press = now
+                if remaining <= 0:
                     raise
-                else:
-                    seconds -= time.time() - t0
-                    print('\ninterrupt', num, 'x again to cancel. otherwise going to sleep', round(seconds),
-                          's more ..')
+                seconds -= now - t0
+                print('\ninterrupt %d x again within %gs to cancel. otherwise going to sleep %d'
+                      's more ..' % (remaining, burst_s, round(seconds)))
     return True
