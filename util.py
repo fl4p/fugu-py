@@ -1,21 +1,90 @@
 import logging
+import logging.handlers
 import math
+import os
 import time
 
+LOG_FORMAT = '%(asctime)s %(levelname)s [%(module)s] %(message)s'
+# Full date on disk. The console format carries only %H:%M:%S, which is fine while someone is
+# watching it, and useless in a file that outlives the day it was written.
+FILE_LOG_FORMAT = '%(asctime)s %(levelname)s [%(module)s] %(message)s'
+FILE_DATEFMT = '%Y-%m-%d %H:%M:%S'
 
-def get_logger(verbose=False):
-    # log_format = '%(asctime)s %(levelname)-6s [%(filename)s:%(lineno)d] %(message)s'
-    log_format = '%(asctime)s %(levelname)s [%(module)s] %(message)s'
-    if verbose:
-        level = logging.DEBUG
-    else:
-        level = logging.INFO
 
-    logging.basicConfig(level=level, format=log_format, datefmt='%H:%M:%S')
+def get_logger(verbose=False, log_path=None, file_level=logging.DEBUG,
+               max_bytes=8 << 20, backups=5):
+    """Configure and return the root logger. Optionally ALSO write it to `log_path`.
+
+    Console behaviour is unchanged when `log_path` is None, which is every existing caller.
+
+    `log_path` exists because the console traffic from a Fugu is the highest-value diagnostic
+    this library produces -- the raw `Ser:` firmware lines: duty clamping ("dc: out of range
+    [0,3751]"), sync-rect transitions, converter enable/disable, the trip/backoff fault loop --
+    and it went to stderr and nowhere else. That is tolerable for a script somebody is watching
+    and wrong for a LONG-LIVED SESSION: a process that holds two converters across many runs
+    and parks them on an idle watchdog is the one whose history matters most, and it was the
+    only one keeping none. Correlating a refused measurement against what the firmware actually
+    did at that instant is not possible after the fact if the lines were never written down.
+
+    Raises OSError if `log_path` cannot be opened, after trying to create its parent directory.
+    Deliberately NOT swallowed: a caller that asked for a log and did not get one must not
+    proceed believing it has one. Whether that is fatal is the CALLER's decision -- a library
+    has no business deciding that a missing log file should stop someone else's bench -- so
+    wrap the call if you want to continue without it, and say so when you do.
+    """
+    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO,
+                        format=LOG_FORMAT, datefmt='%H:%M:%S')
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
-
+    if log_path:
+        add_file_log(log_path, level=file_level, max_bytes=max_bytes, backups=backups)
     return logger
+
+
+def add_file_log(path, level=logging.DEBUG, max_bytes=8 << 20, backups=5, logger=None):
+    """Also write the log to `path`, rotating. -> the resolved absolute path.
+
+    ROTATES because the caller is expected to be long-running: a session streaming ~1 Hz status
+    lines plus console output from two devices grows without bound otherwise, and an unattended
+    bench filling its own disk is a worse failure than a truncated log.
+
+    The file handler defaults to DEBUG even when the console is at INFO -- full detail on disk,
+    readable summary on screen, which is the point of having a file at all. Records are filtered
+    by the LOGGER's level before any handler sees them, so the root level has to be lowered for
+    that to work; every existing StreamHandler is first pinned to its current effective level so
+    CONSOLE OUTPUT DOES NOT CHANGE. Without that pinning, adding a log file would silently start
+    dumping debug traffic onto the terminal of every caller.
+
+    Idempotent per resolved path: calling it twice does not double-write. `get_logger` is invoked
+    at import time by half the modules in this package, so a second call is the normal case, not
+    an abuse.
+    """
+    logger = logger or logging.getLogger()
+    resolved = os.path.abspath(os.path.expanduser(path))
+    for h in logger.handlers:
+        if isinstance(h, logging.FileHandler) and \
+                os.path.abspath(getattr(h, "baseFilename", "")) == resolved:
+            return resolved
+    parent = os.path.dirname(resolved)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(
+        resolved, maxBytes=max_bytes, backupCount=backups)
+    handler.setLevel(level)
+    handler.setFormatter(logging.Formatter(FILE_LOG_FORMAT, datefmt=FILE_DATEFMT))
+    if level < logger.level:
+        # Pin the console FIRST, then lower the gate. Order matters: doing it the other way
+        # round leaves a window in which the stream handler inherits DEBUG.
+        for h in logger.handlers:
+            # FileHandler SUBCLASSES StreamHandler, so exclude it explicitly -- otherwise an
+            # earlier file log would get pinned to the console level and stop recording debug.
+            if isinstance(h, logging.StreamHandler) \
+                    and not isinstance(h, logging.FileHandler) \
+                    and h.level == logging.NOTSET:
+                h.setLevel(logger.level)
+        logger.setLevel(level)
+    logger.addHandler(handler)
+    return resolved
 
 
 def round_to_n(x, n):
