@@ -135,6 +135,10 @@ def round_to_n_dec(x, n):
         return num2str(x, n)
 
 
+class TerminationRequested(BaseException):
+    pass
+
+
 def sleep_confirm_interrupt(seconds, num=3, poll=None, burst_s=5) -> bool:
     """Sleep, polling once a second, and cancel only on `num` interrupts in quick succession.
 
@@ -152,22 +156,22 @@ def sleep_confirm_interrupt(seconds, num=3, poll=None, burst_s=5) -> bool:
     accidental press minutes earlier cannot combine with two deliberate ones later.
     """
     import tqdm
-    t_start = time.time()
+    total = left = float(seconds)
     remaining = num
     last_press = None
-    t0 = t_start
-    with tqdm.tqdm(total=seconds, desc='measurement ..', position=1, leave=False) as pbar:
-        while seconds > 0:
+    t0 = time.time()
+    with tqdm.tqdm(total=total, desc='measurement ..', position=1, leave=False) as pbar:
+        while left > 0:
             try:
                 t0 = time.time()
-                for i in range(int(seconds)):
-                    time.sleep(1)
-                    if poll and not poll():
-                        print("poll did not return true")
-                        return False
-                    passed = time.time() - t_start
-                    pbar.update(int(passed) - pbar.n)
-                break
+                sleep_s = min(1.0, left)
+                time.sleep(sleep_s)
+                if poll and not poll():
+                    print("poll did not return true")
+                    return False
+                elapsed = max(0.0, time.time() - t0)
+                left -= max(sleep_s, elapsed)
+                pbar.update(min(total, total - max(left, 0.0)) - pbar.n)
             except KeyboardInterrupt:
                 now = time.time()
                 if last_press is None or (now - last_press) >= burst_s:
@@ -176,7 +180,7 @@ def sleep_confirm_interrupt(seconds, num=3, poll=None, burst_s=5) -> bool:
                 last_press = now
                 if remaining <= 0:
                     raise
-                seconds -= now - t0
+                left -= max(0.0, now - t0)
                 print('\ninterrupt %d x again within %gs to cancel. otherwise going to sleep %d'
-                      's more ..' % (remaining, burst_s, round(seconds)))
+                      's more ..' % (remaining, burst_s, round(max(left, 0.0))))
     return True
