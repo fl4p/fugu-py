@@ -364,10 +364,43 @@ class FuguDevice:
         logger.debug(self.prefix + 'pwm limits: pwm_max=%s pwm_ctrl_max=%s freq=%s',
                      self._pwm_max, self._pwm_ctrl_max, self.pwm_freq)
 
-    def set_pwm(self, pwm_cnt, step_wait=0.05) -> int:
-        """Set raw HS on-count (`dc` units, driver-resolution dependent), ramping in steps.
-        Returns the count sent."""
+    def set_pwm(self, pwm_cnt, step_wait=0.05, host_ramp=True) -> int:
+        """Set raw HS on-count (`dc` units, driver-resolution dependent). Returns the count sent.
+
+        `host_ramp=False` writes the target ONCE and lets the firmware fade to it, which is
+        both much faster and strictly more correct.
+
+        THE FIRMWARE ALREADY FADES. `dc` sets `mppt.manualTarget`
+        (fugu-mppt-firmware `src/cli.cpp:166`), which is persistent -- "survives backoff,
+        cleared only by dc 0" (`src/mppt.h:180`) -- and `updateManual()` walks the duty toward
+        it one `rampStep` per call (`src/mppt.cpp:402`):
+
+            rampStep = max(1, round(pwmMaxDriver / 512))          # 8 counts at pwmMaxDriver=4071
+
+        `updateManual()` runs on every new ADC sample (`src/main.cpp:942`), and the telemetry
+        line reports 1699 sps, so the device fades at ~13600 counts/s. The host ramp here moves
+        20 counts per BLE write, and a write measured ~115 ms on this bench (668 `dc` writes at
+        8-9/s in one session), i.e. ~174 counts/s. So stepping from the host made every ramp
+        about 78x SLOWER than the fade the firmware was going to do anyway: ~11 s for a
+        2000-count change instead of ~0.15 s.
+
+        It also removes a real hazard rather than just latency. The host ramp seeds itself from
+        `self.pwm_state.pwm_ctrl`, which only refreshes when a status line arrives (~1 Hz). If
+        that value is stale -- after a reboot, or a firmware-side backoff that dropped the duty
+        -- the first "step" is computed from a duty the converter is not at, and the ramp becomes
+        an unramped STEP of arbitrary size. Writing the target once cannot do that: the firmware
+        ramps from the duty it actually has.
+
+        Kept opt-in, and `True` remains the default, because callers that deliberately want
+        host-paced motion (sweeping duty while watching a measurand between steps) rely on it,
+        and because the two fade rates are genuinely different -- 78x is a change in converter
+        behaviour, not only in wall-clock.
+        """
         pwm_cnt = int(pwm_cnt)
+        if not host_ramp:
+            self.transport.write(b'dc %d\n' % pwm_cnt)
+            logger.debug('Set pwm_cnt = %d (device fade)', pwm_cnt)
+            return pwm_cnt
         # ~0.5% of range per step, same fade rate as the tuned 10/2048
         max_step = max(10, round(self._pwm_max * 10 / 2048)) if self._pwm_max else 10
 
@@ -375,12 +408,11 @@ class FuguDevice:
 
         while pwm_ctrl != pwm_cnt:
             delta = pwm_cnt - pwm_ctrl
-            # dont fade if target is 0
-            if pwm_cnt != 0 and abs(delta) > max_step:
+            if abs(delta) > max_step:
                 delta = max_step * delta / abs(delta)
             pwm_ctrl += delta
             self.transport.write(b'dc %d\n' % pwm_ctrl)
-            time.sleep(step_wait / 4 if delta < 0 else step_wait)
+            time.sleep(step_wait)
 
         logger.debug('Set pwm_cnt = %d', pwm_cnt)
         return pwm_cnt
@@ -460,8 +492,21 @@ class FuguDevice:
         self.command_ack('sweep')
 
     def mppt_enable(self):
-        # leave manual PWM, resume MPP tracking
-        self.command_ack('mppt')
+        """Leave manual PWM, resume MPP tracking. Idempotent.
+
+        The firmware answers an already-tracking device with a WARNING, not an OK marker
+        ('W main: MPPT already enabled'), so command_ack raises -- turning a request whose
+        POSTCONDITION IS ALREADY SATISFIED into a hard failure. Callers that use this to
+        establish a precondition (set_vout) would abort on the one state they wanted.
+        Anything else still raises: the point is to accept success, not to swallow errors.
+        """
+        try:
+            self.command_ack('mppt')
+        except Exception:
+            if not any('MPPT already enabled' in l for l in self.ser_tail):
+                raise
+            logger.debug(self.prefix + 'mppt: already enabled')
+        return True
 
     def set_speed(self, scale: float):
         self.command_ack('speed %g' % scale)
@@ -478,7 +523,8 @@ class FuguDevice:
     def set_ibat_lim(self, amps: float):
         self.command_ack('iset %g' % amps)
 
-    def set_vout(self, volts: float, tol_v=0.5, timeout=20.0, hold=1.0, poll=0.25):
+    def set_vout(self, volts: float, tol_v=0.5, timeout=20.0, hold=1.0, poll=0.25,
+                 leave_manual_pwm=True):
         """Set the output-voltage setpoint and WAIT until the measured Vout actually holds it.
 
         Uses the firmware's own regulator (`vset` -> charger Vbat_max). Do NOT drive output
@@ -497,12 +543,22 @@ class FuguDevice:
 
         `tol_v` is the acceptance band, not a controller gain -- nothing here regulates.
 
-        Precondition: the converter must NOT be in manual PWM (`dc N`, which is where
-        power_loop_rig_sequence_buck and manual_pwm() leave it). The firmware runs
-        updateManual() there, which only ramps duty toward the manual target -- the CV
-        controller `vset` feeds never executes, so this can only ever time out. Call `mppt`
-        first. There is no console query for the mode, so this is not enforced here.
+        Precondition, ESTABLISHED HERE rather than merely documented: the converter must not
+        be in manual PWM (`dc N`, which is where power_loop_rig_sequence_buck and
+        manual_pwm() leave it). The firmware runs updateManual() there, which only ramps duty
+        toward the manual target -- the CV controller `vset` feeds never executes. So in
+        manual PWM this method cannot do anything except time out, while a caller reading only
+        the docstring believes it is regulating.
+
+        MEASURED, 2026-08-11: an fboost left at `pwm_ctrl=2499` from an earlier session held
+        Vout at 25.8 V and ignored `vset 20`, `vset 30` and `vset 40` in turn -- three
+        identical 20 s timeouts reporting the same 26.1 V. Nothing in the failure text pointed
+        at the mode, because nothing had checked it. `leave_manual_pwm=True` sends `mppt`
+        first; pass False only if you have already put the device in a regulating mode and do
+        not want MPP tracking re-armed underneath you.
         """
+        if leave_manual_pwm:
+            self.mppt_enable()
         self.set_vbat_max(volts)
         t0 = time.monotonic()
         in_band_since = None
@@ -533,11 +589,22 @@ class FuguDevice:
                 # must hold, not just touch: overshoot is not settled
                 in_band_since, samples_in_band = None, 0
             time.sleep(poll)
+        # Name the candidate causes. A bare "did not settle" sent the caller looking at the
+        # regulator when the real answer was twice something else: the device was in manual
+        # PWM (see above), and a BOOST cannot go below its own input, so any setpoint under
+        # Vin times out identically to a broken loop.
+        why = ''
+        if in_band_since:
+            why = ' (reached the band but never held it over %d fresh samples)' % samples_in_band
+        elif len(self.voltages) > 0 and self.voltages[0] == self.voltages[0] \
+                and volts < self.voltages[0]:
+            why = (' -- setpoint is BELOW this converter\'s own input (%.2fV); a boost cannot '
+                   'buck' % self.voltages[0])
+        elif not leave_manual_pwm:
+            why = ' -- called with leave_manual_pwm=False; is the CV controller actually running?'
         raise TimeoutError(
             '%sset_vout(%.3f): Vout=%.3fV after %.0fs, outside +/-%.3fV%s'
-            % (self.prefix, volts, last, timeout, tol_v,
-               ' (reached the band but never held it over %d fresh samples)' % samples_in_band
-               if in_band_since else ''))
+            % (self.prefix, volts, last, timeout, tol_v, why))
 
     # --- misc actuators ------------------------------------------------------------------------
 
