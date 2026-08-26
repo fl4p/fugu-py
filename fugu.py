@@ -342,7 +342,13 @@ class FuguDevice:
     def query_pwm_limits(self):
         """Populate pwm_max/pwm_freq from `pwm-dump` and pwm_ctrl_max (the `dc` clamp
         limit) from an out-of-range `dc` probe. Raises if neither yields anything --
-        never silently assumes a resolution."""
+        never silently assumes a resolution. Each field is FRESH OR ABSENT after this
+        call, never stale: pwm_max moves by -delta_lh_ticks on every dead-time write
+        (`pwm_max = periodTicks - lh`, firmware src/pwm/mcpwm.h:366), so a value kept
+        from a previous call is a failed probe reading as a verified one."""
+        # A failed or non-matching pwm-dump must leave pwm_max ABSENT, symmetric with the
+        # dc half below. A warning in a log is not a state.
+        self._pwm_max = None
         try:
             for l in self.query('pwm-dump'):
                 if m := re.search(r'freq=(\d+) pwmMax=(\d+)', l):
