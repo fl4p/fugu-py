@@ -405,6 +405,58 @@ class FuguDevice:
     def get_duty(self) -> float:
         return self.pwm_state.pwm_ctrl / self.pwm_max
 
+    # --- gate dead-time (MCPWM only) ------------------------------------------------------------
+    # One value per transition: hl = ctrl-off -> rect-on (mid-period, hardware RED, realized gap is
+    # one tick less), lh = rect-off -> ctrl-on (period wrap, reserved out of pwmMax, realized band
+    # one tick wider). Both are RAM-only; board.conf::pwm_deadtime_hl_ns / _lh_ns own the boot value.
+
+    def get_deadtime(self) -> dict:
+        """Live dead-time as {hl_ns, hl_ct, hl_gap_ct, lh_ns, lh_ct, pwm_max, min_ls, max_hs}.
+
+        Raises RuntimeError with the device's own reason when there is nothing to report -- an
+        InEn gate driver or the LEDC path has no dead-time module at all, and a board booted with
+        pwm_deadtime_hl_ns=0 left it bypassed. Neither is the same as "dead-time is 0", so this
+        never degrades to a zero."""
+        reply = self.console.command('dt')
+        for l in reply:
+            if m := self._DT_RE.search(l):
+                return dict(hl_ns=float(m.group(1)), hl_ct=int(m.group(2)), hl_gap_ct=int(m.group(3)),
+                            lh_ns=float(m.group(4)), lh_ct=int(m.group(5)),
+                            pwm_max=int(m.group(6)), min_ls=int(m.group(7)), max_hs=int(m.group(8)))
+        raise RuntimeError('dt: %s' % (self._dt_reason(reply) or 'no readable reply'))
+
+    def set_deadtime(self, hl_ns: float, lh_ns: Optional[float] = None) -> dict:
+        """Retune the dead-time and return the resulting get_deadtime() dict.
+
+        One argument sets both transitions (the console's back-compatible form); pass lh_ns to set
+        them independently. The firmware applies this on the RT core and confirms within a control
+        tick, so a rejection is reported here rather than silently dropped.
+
+        LOWERING either value needs manual PWM -- shortening a dead-band is the direction that can
+        short the half-bridge, so the firmware refuses it while the tracker is driving. Call
+        manual_pwm() first (it changes converter state, so this does not do it for you). Raising is
+        allowed in any mode but is an *unramped* duty step: at the 1/32 ceiling max_hs drops by
+        ~190 counts in one tick."""
+        cmd = 'dt %g' % hl_ns if lh_ns is None else 'dt %g %g' % (hl_ns, lh_ns)
+        reply = self.console.command(cmd, timeout=5.0)  # RT ack costs up to 1 s inside the command
+        if not reply.ok:
+            raise RuntimeError('%s rejected: %s' % (cmd, self._dt_reason(reply) or 'no reason given'))
+        return self.get_deadtime()
+
+    _DT_RE = re.compile(r'dt hl=([\d.]+) ns \((\d+) ct, gap (\d+) ct\)'
+                        r' lh=([\d.]+) ns \((\d+) ct\)'
+                        r' pwmMax=(\d+) minLS=(\d+) maxHS=(\d+)')
+    # refusals arrive as the ESP_LOGW line behind CMD_FAIL_RETURN, e.g.
+    # "W (1234) main: dt: lowering the dead-time needs manual PWM (use 'dc N' first)"
+    _DT_ERR_RE = re.compile(r'\bdt: (.+?)\s*$')
+
+    @staticmethod
+    def _dt_reason(lines):
+        for l in reversed(list(lines)):
+            if m := FuguDevice._DT_ERR_RE.search(l):
+                return m.group(1)
+        return None
+
     def wifi_power(self, on, minutes=None):
         # not acked: turning Wi-Fi off drops telnet/BLE, so an OK marker may never arrive.
         # `minutes` re-enables after a timeout (keeps the stored SSID); bare off forgets it.
