@@ -1,5 +1,7 @@
 import asyncio
+import concurrent.futures
 import glob
+import importlib
 import logging
 import os
 import queue
@@ -14,6 +16,14 @@ import serial  # pyserial
 from .util import get_logger
 
 logger = get_logger()
+
+_BLE_BACKEND = os.environ.get('FUGU_BLE_BACKEND', 'bleak')
+if _BLE_BACKEND == 'bluek':
+    importlib.import_module('bluek.shadow')
+elif _BLE_BACKEND == 'bumble':
+    importlib.import_module('bumble_bleak.shadow')
+elif _BLE_BACKEND != 'bleak':
+    raise ValueError('unknown FUGU_BLE_BACKEND %r' % _BLE_BACKEND)
 
 
 class Transport(object):
@@ -193,7 +203,8 @@ class BleTransport(Transport):
     # makes a connect take 5-17 s. So a 30 s attempt times out as readily as a 10 s one; only
     # re-issuing helps. `adapter` (below) is the actual cure.
     def __init__(self, name="fugu", address=None, scan_timeout=10.0, connect_retries=5,
-                 connect_timeout=12.0, read_timeout=0.3, tele_cb=None, adapter=None):
+                 connect_timeout=12.0, read_timeout=0.3, tele_cb=None, adapter=None,
+                 pair=False):
         self.name = name
         self.address = address
         # BlueZ adapter (hci0/hci1…), $BLE_ADAPTER by default. A Pi's on-board controller shares
@@ -204,6 +215,7 @@ class BleTransport(Transport):
         # order and moves (hci1 became hci0 here the moment the on-board radio was disabled),
         # the address doesn't. Resolved in _connect(), which has the event loop.
         self.adapter = adapter if adapter is not None else os.environ.get("BLE_ADAPTER")
+        self.pair = pair
         self._adapter_kw = {}
         self.scan_timeout = scan_timeout
         self.connect_retries = connect_retries
@@ -219,7 +231,12 @@ class BleTransport(Transport):
     def _submit(self, coro, timeout=30.0):
         # Bounded: a GATT op can stall forever (e.g. BlueZ on-demand pairing for an encrypted
         # char never completing headlessly) — fail fast instead of hanging the caller.
-        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout)
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        try:
+            return future.result(timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise
 
     # Process-wide: BlueZ races on concurrent scans/connects ("Operation already in progress"),
     # so every BleTransport open (incl. Console.reconnect) serializes here. Callers doing their
@@ -347,6 +364,8 @@ class BleTransport(Transport):
             client = BleakClient(dev, **self._adapter_kw)  # fresh per attempt: a half-connected client fails re-connect()
             try:
                 await client.connect(timeout=self.connect_timeout)
+                if self.pair:
+                    await client.pair()
                 break
             except Exception as e:
                 last = e
