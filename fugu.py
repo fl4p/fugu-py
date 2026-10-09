@@ -627,12 +627,12 @@ class FuguDevice:
         already there. Leave with `dc N` (manual PWM, what the rig park does) or `psu off`
         (back to MPPT).
 
-        Needs a firmware with CONFIG_FUGU_WITH_PSU (fugu-mppt-firmware >= bac12173). Older
-        images answer `Command not found`, and this raises instead of falling back to
-        `mppt` + `vset`: on an unloaded boost that path cannot regulate. Measured on fboost
-        2026-10-09 (fry-brk1-179): `vset 20` from 25.9 V made the CV limiter walk the duty
-        2303 -> 1 while the unloaded output decayed slowly, and it then sat at pwm=1 with Vout
-        at Vin - diode (9.43 V) for 40+ s.
+        Needs a firmware with CONFIG_FUGU_WITH_PSU (fugu-mppt-firmware >= bac12173); older
+        images answer `Command not found` and this raises. Outside manual PWM every limiter
+        runs, including the Vin floor (limits.conf::vin_min): with vin_min above the source
+        voltage the Vin controller pins the duty at 1 and Vout sits at Vin - diode (fboost had
+        vin_min=26 on a 10 V source, 2026-10-09). A setpoint below Vout/1.5 trips Vout-OV once
+        (PSU fast retry) before it settles, because the OV band follows the new setpoint.
 
         Raises TimeoutError if Vout does not hold the band for `hold` s over >= 2 fresh status
         lines, ConnectionError on stale telemetry, RuntimeError if the firmware refuses the
@@ -644,7 +644,7 @@ class FuguDevice:
             if 'Command not found' in text:
                 raise RuntimeError(
                     '%sset_vout: firmware has no PSU mode (`psu` not found); update it '
-                    '(CONFIG_FUGU_WITH_PSU). mppt+vset does not regulate an unloaded boost.'
+                    '(CONFIG_FUGU_WITH_PSU)'
                     % self.prefix)
             raise RuntimeError('%sset_vout(%g): psu refused: %s' % (self.prefix, volts, text))
         t0 = time.monotonic()
@@ -708,7 +708,14 @@ class FuguDevice:
     # --- system / diagnostics ------------------------------------------------------------------
 
     def restart(self):
-        self.write('restart\n')  # device reboots; no OK marker comes back
+        """Reboot the device. No OK marker comes back, and over BLE the write itself can fail
+        with a disconnect because the device reboots before acknowledging it."""
+        try:
+            self.write('restart\n')
+        except Exception as e:                                          # noqa: BLE001
+            if 'disconnect' not in str(e).lower():
+                raise
+            logger.info(self.prefix + 'restart: link dropped before the write was acknowledged')
 
     def adc_restart(self):
         self.command_ack('adc-restart')
