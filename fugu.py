@@ -619,7 +619,7 @@ class FuguDevice:
                         'trips': int(d['trips']) if d['trips'] else 0}
         raise RuntimeError('%spsu: no status in reply %r' % (self.prefix, list(reply)))
 
-    def set_vout(self, volts: float, tol_v=0.5, timeout=20.0, hold=1.0, poll=0.25):
+    def set_vout(self, volts: float, tol_v=0.5, timeout=None, hold=1.0, poll=0.25):
         """Regulate the output to `volts` with the firmware's PSU (constant-voltage) mode and
         wait until the measured Vout holds it. Returns the measured Vout.
 
@@ -631,8 +631,10 @@ class FuguDevice:
         images answer `Command not found` and this raises. Outside manual PWM every limiter
         runs, including the Vin floor (limits.conf::vin_min): with vin_min above the source
         voltage the Vin controller pins the duty at 1 and Vout sits at Vin - diode (fboost had
-        vin_min=26 on a 10 V source, 2026-10-09). A setpoint below Vout/1.5 trips Vout-OV once
-        (PSU fast retry) before it settles, because the OV band follows the new setpoint.
+        vin_min=26 on a 10 V source, 2026-10-09). Since fugu-mppt-firmware ce9e3ef a lower
+        setpoint is approached at converter.conf::psu_slew_down (2 V/s); older PSU images step
+        down, trip Vout-OV and can pump the input rail. `timeout=None` allows 20 s plus the
+        step-down at 2 V/s.
 
         Raises TimeoutError if Vout does not hold the band for `hold` s over >= 2 fresh status
         lines, ConnectionError on stale telemetry, RuntimeError if the firmware refuses the
@@ -647,6 +649,9 @@ class FuguDevice:
                     '(CONFIG_FUGU_WITH_PSU)'
                     % self.prefix)
             raise RuntimeError('%sset_vout(%g): psu refused: %s' % (self.prefix, volts, text))
+        if timeout is None:
+            v_now = self.voltages[1] if len(self.voltages) > 1 else nan
+            timeout = 20.0 + (max(0.0, v_now - volts) / 2.0 if v_now == v_now else 0.0)
         t0 = time.monotonic()
         entered_t = self._last_telemetry_t  # status lines older than the command are history
         in_band_since = None
