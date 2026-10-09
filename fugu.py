@@ -351,9 +351,20 @@ class FuguDevice:
         self._pwm_max = None
         try:
             for l in self.query('pwm-dump'):
-                if m := re.search(r'freq=(\d+) pwmMax=(\d+)', l):
-                    self.pwm_freq = int(m.group(1))
-                    self._pwm_max = int(m.group(2))
+                # FIELDS ARE FOUND INDEPENDENTLY, not by their adjacency. This read
+                # `freq=(\d+) pwmMax=(\d+)` in one match until 2026-09-04, when the run-time
+                # pwm-freq build (fl4p/fugu-mppt-firmware#62) made `freq` a FLOAT and inserted
+                # `nominal=` and `period_ticks=` between the two. The line still carried both
+                # numbers and the regex still "worked" -- it simply never matched, so pwm_max
+                # stayed None and every set_duty() raised, including the one the PARK uses.
+                # A converter that cannot be commanded to its idle rung is what that costs.
+                if m := re.search(r'\bfreq=([\d.]+)', l):
+                    # float since the run-time build: it is the REALIZED frequency, where the
+                    # older format printed the requested integer. `nominal=`, when present,
+                    # carries what was asked for.
+                    self.pwm_freq = float(m.group(1))
+                if m := re.search(r'\bpwmMax=(\d+)', l):
+                    self._pwm_max = int(m.group(1))
         except Exception as e:
             logger.warning(self.prefix + 'pwm-dump failed (%s), probing dc limit', e)
         # rejected before any mode/duty change, so this has no side effect
