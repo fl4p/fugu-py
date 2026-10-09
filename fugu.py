@@ -21,12 +21,22 @@ logger = get_logger()
 
 # 'V=73.6/27.25 I=3.75/ 9.88A 276.3W 53℃54℃ 454sps  0㎅/s CCM(H|L|Lm)= 790|1257|1257 st= MANU,0 lag=3292㎲ N=1192849 rssi=0'
 r_float = r'(\d+\.?\d*(e\d+\.?\d*)?|nan)'
+# firmware since e246ea8 prints '--' for a stale temperature (fugu-mppt-firmware issue #65)
+r_temp = r'(-?\d+\.?\d*|nan|--)'
 RE_PWM = re.compile(
     r'V=\s*(?P<vin>[0-9.]+)\s*/\s*(?P<vout>[0-9.]+).+'
-    fr'([0-9.]+)W (?P<tmp_ntc>{r_float})℃(?P<tmp_mcu>{r_float})℃\s.*'
+    fr'([0-9.]+)W (?P<tmp_ntc>{r_temp})℃(?P<tmp_mcu>{r_temp})℃\s.*'
     r'(?P<mode>[CD]CM)\(H\|L\|Lm\)=\s*(?P<ctrl>[0-9]+)\|\s*(?P<sync>[0-9]+)\|\s*(?P<sync_max>[0-9]+)\s.+'
     r'rssi=\s*(?P<rssi>-?[0-9]+)'
 )
+# operating mode on the same status line: MANU, PSU, PVS, START, UV or an MPPT state
+RE_ST = re.compile(r' st=\s*(?P<st>[A-Za-z_]+),')
+# `psu` (no arg): 'PSU: on vset=20.00V ok trips=0' | 'PSU: pending ...' | 'PSU: off'
+RE_PSU = re.compile(r'PSU: (?P<state>on|pending|off)(?: vset=(?P<vset>[0-9.]+)V (?P<health>\w+) trips=(?P<trips>\d+))?')
+
+
+def _temp(v):
+    return nan if v in (None, '--') else float(v)
 
 # Crash/panic markers in the serial log. `rst:0x..` is intentionally NOT here: the bootloader prints
 # it on every reset (incl. a clean `restart` and power-on), so it signals a reboot, not a crash.
@@ -96,6 +106,7 @@ class FuguDevice:
         self.wifi_rssi = 0
         self.temperatures = []
         self.voltages = []
+        self.op_mode = None  # st= field of the last status line (MANU, PSU, ...)
         # monotonic time of the last parsed telemetry line, see telemetry_fresh()
         self._last_telemetry_t = None
 
@@ -192,8 +203,10 @@ class FuguDevice:
                          pwm_sync=int(d['sync']),
                          pwm_sync_max=int(d['sync_max']))
             self.wifi_rssi = int(d.get('rssi', 0))
-            self.temperatures = [float(d.get('tmp_ntc', nan)), float(d.get('tmp_mcu', nan))]
+            self.temperatures = [_temp(d.get('tmp_ntc')), _temp(d.get('tmp_mcu'))]
             self.voltages = [float(d.get('vin', nan)), float(d.get('vout', nan))]
+            st = RE_ST.search(rx)
+            self.op_mode = st.group('st') if st else None
             self._last_telemetry_t = time.monotonic()
 
             if self.pwm_state != s:
@@ -592,44 +605,50 @@ class FuguDevice:
     def set_ibat_lim(self, amps: float):
         self.command_ack('iset %g' % amps)
 
-    def set_vout(self, volts: float, tol_v=0.5, timeout=20.0, hold=1.0, poll=0.25,
-                 leave_manual_pwm=True):
-        """Set the output-voltage setpoint and WAIT until the measured Vout actually holds it.
+    def psu_status(self) -> dict:
+        """`psu` readback: {'state': 'on'|'pending'|'off', 'vset', 'health', 'trips'}.
+        health is 'ok', 'escalated' or 'LATCHED'."""
+        reply = self.query('psu')
+        for line in reply:
+            m = RE_PSU.search(line)
+            if m:
+                d = m.groupdict()
+                return {'state': d['state'],
+                        'vset': float(d['vset']) if d['vset'] else nan,
+                        'health': d['health'],
+                        'trips': int(d['trips']) if d['trips'] else 0}
+        raise RuntimeError('%spsu: no status in reply %r' % (self.prefix, list(reply)))
 
-        Uses the firmware's own regulator (`vset` -> charger Vbat_max). Do NOT drive output
-        voltage by stepping duty from the host: a console round trip is orders of magnitude
-        slower than the converter's control loop, and a host loop fights the regulator it is
-        trying to help.
+    def set_vout(self, volts: float, tol_v=0.5, timeout=20.0, hold=1.0, poll=0.25):
+        """Regulate the output to `volts` with the firmware's PSU (constant-voltage) mode and
+        wait until the measured Vout holds it. Returns the measured Vout.
 
-        Returns the measured Vout. Raises rather than returning a voltage it did not see:
+        `psu V` enters PSU mode from any mode (manual PWM included) and re-targets it when
+        already there. Leave with `dc N` (manual PWM, what the rig park does) or `psu off`
+        (back to MPPT).
 
-        * TimeoutError if Vout never enters the band, or does not stay in it for `hold`
-          seconds -- reported WITH the measured value, so the caller can tell "regulator is
-          still ramping" from "this setpoint is unreachable".
-        * ConnectionError if telemetry goes stale, because a frozen `voltages` reads as a
-          perfectly settled rail exactly when we have gone blind. Absence of evidence must
-          not encode a settled output.
+        Needs a firmware with CONFIG_FUGU_WITH_PSU (fugu-mppt-firmware >= bac12173). Older
+        images answer `Command not found`, and this raises instead of falling back to
+        `mppt` + `vset`: on an unloaded boost that path cannot regulate. Measured on fboost
+        2026-10-09 (fry-brk1-179): `vset 20` from 25.9 V made the CV limiter walk the duty
+        2303 -> 1 while the unloaded output decayed slowly, and it then sat at pwm=1 with Vout
+        at Vin - diode (9.43 V) for 40+ s.
 
-        `tol_v` is the acceptance band, not a controller gain -- nothing here regulates.
-
-        Precondition, ESTABLISHED HERE rather than merely documented: the converter must not
-        be in manual PWM (`dc N`, which is where power_loop_rig_sequence_buck and
-        manual_pwm() leave it). The firmware runs updateManual() there, which only ramps duty
-        toward the manual target -- the CV controller `vset` feeds never executes. So in
-        manual PWM this method cannot do anything except time out, while a caller reading only
-        the docstring believes it is regulating.
-
-        MEASURED, 2026-08-11: an fboost left at `pwm_ctrl=2499` from an earlier session held
-        Vout at 25.8 V and ignored `vset 20`, `vset 30` and `vset 40` in turn -- three
-        identical 20 s timeouts reporting the same 26.1 V. Nothing in the failure text pointed
-        at the mode, because nothing had checked it. `leave_manual_pwm=True` sends `mppt`
-        first; pass False only if you have already put the device in a regulating mode and do
-        not want MPP tracking re-armed underneath you.
+        Raises TimeoutError if Vout does not hold the band for `hold` s over >= 2 fresh status
+        lines, ConnectionError on stale telemetry, RuntimeError if the firmware refuses the
+        setpoint or leaves PSU mode (trip latch, OV). `tol_v` is an acceptance band only.
         """
-        if leave_manual_pwm:
-            self.mppt_enable()
-        self.set_vbat_max(volts)
+        reply = self.console.command('psu %g' % volts)
+        if not reply.ok:
+            text = reply.text
+            if 'Command not found' in text:
+                raise RuntimeError(
+                    '%sset_vout: firmware has no PSU mode (`psu` not found); update it '
+                    '(CONFIG_FUGU_WITH_PSU). mppt+vset does not regulate an unloaded boost.'
+                    % self.prefix)
+            raise RuntimeError('%sset_vout(%g): psu refused: %s' % (self.prefix, volts, text))
         t0 = time.monotonic()
+        entered_t = self._last_telemetry_t  # status lines older than the command are history
         in_band_since = None
         samples_in_band = 0
         seen_sample_t = None
@@ -639,13 +658,14 @@ class FuguDevice:
                 raise ConnectionError(
                     '%sset_vout(%.3f): telemetry went stale (%.1fs old) -- the measured output '
                     'is unknown, not settled' % (self.prefix, volts, self.telemetry_age()))
-            # poll (0.25s) is faster than the device's ~1 Hz status line, so track which
-            # readings are actually NEW: re-reading one frozen sample for `hold` seconds is not
-            # evidence of a settled rail, and telemetry_fresh() only trips after 10s
             fresh_sample = self._last_telemetry_t != seen_sample_t
             seen_sample_t = self._last_telemetry_t
+            post_cmd = self._last_telemetry_t != entered_t
+            if post_cmd and fresh_sample and self.op_mode not in (None, 'PSU'):
+                raise RuntimeError('%sset_vout(%.3f): converter left PSU mode (st=%s, Vout=%.3fV)'
+                                   % (self.prefix, volts, self.op_mode, self.voltages[1]))
             last = self.voltages[1] if len(self.voltages) > 1 else nan
-            if last == last and abs(last - volts) <= tol_v:
+            if post_cmd and last == last and abs(last - volts) <= tol_v:
                 if in_band_since is None:
                     in_band_since, samples_in_band = time.monotonic(), 1
                 elif fresh_sample:
@@ -655,25 +675,18 @@ class FuguDevice:
                                  volts, last, samples_in_band)
                     return last
             else:
-                # must hold, not just touch: overshoot is not settled
                 in_band_since, samples_in_band = None, 0
             time.sleep(poll)
-        # Name the candidate causes. A bare "did not settle" sent the caller looking at the
-        # regulator when the real answer was twice something else: the device was in manual
-        # PWM (see above), and a BOOST cannot go below its own input, so any setpoint under
-        # Vin times out identically to a broken loop.
-        why = ''
-        if in_band_since:
-            why = ' (reached the band but never held it over %d fresh samples)' % samples_in_band
-        elif len(self.voltages) > 0 and self.voltages[0] == self.voltages[0] \
-                and volts < self.voltages[0]:
-            why = (' -- setpoint is BELOW this converter\'s own input (%.2fV); a boost cannot '
-                   'buck' % self.voltages[0])
-        elif not leave_manual_pwm:
-            why = ' -- called with leave_manual_pwm=False; is the CV controller actually running?'
-        raise TimeoutError(
-            '%sset_vout(%.3f): Vout=%.3fV after %.0fs, outside +/-%.3fV%s'
-            % (self.prefix, volts, last, timeout, tol_v, why))
+        try:
+            st = 'psu %(state)s vset=%(vset).2fV %(health)s trips=%(trips)d' % self.psu_status()
+        except Exception as e:                                          # noqa: BLE001
+            st = 'psu status unavailable: %s' % e
+        why = ' (reached the band but never held it)' if in_band_since else ''
+        if self.voltages and self.voltages[0] == self.voltages[0] and volts <= self.voltages[0]:
+            why += " -- setpoint is not above this converter's input (%.2fV); a boost cannot buck" \
+                   % self.voltages[0]
+        raise TimeoutError('%sset_vout(%.3f): Vout=%.3fV after %.0fs, outside +/-%.3fV%s; %s'
+                           % (self.prefix, volts, last, timeout, tol_v, why, st))
 
     # --- misc actuators ------------------------------------------------------------------------
 
