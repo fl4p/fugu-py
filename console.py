@@ -113,6 +113,9 @@ class Console:
             self.transport.close()
         except Exception as e:
             logger.debug("reconnect close: %s", e)
+        # A fragment of the old link (e.g. `OK: dt 200` without its newline) must not complete
+        # into a line on the new one and acknowledge the next, identical command.
+        self._buf = b""
         self.transport.open()
         self._connect_time = time.monotonic()
         # re-arm the banner wait so the next command rides the new connection's handshake
@@ -223,9 +226,11 @@ class Console:
             self.wait_for_banner()
         self.drain()
         self.write(cmd + self.eol)
-        # The firmware echoes the whole trimmed input after the marker (console.cpp loopConsole), so
-        # the marker must END the line: a substring test let a late `OK: dt 200 300` acknowledge
-        # `dt 200` while that command's own `ERR` stayed unread.
+        # The firmware writes `OK|ERR: <whole trimmed input>` as its own line (console.cpp
+        # loopConsole), so the marker must BE the line, less any `> ` prompt: a substring test let a
+        # late `OK: dt 200 300` acknowledge `dt 200` while that command's own `ERR` stayed unread,
+        # and a suffix test still let `OK: set-config t tag OK: dt 200` do it. A marker glued to
+        # other output now times out (unverified) instead of acknowledging.
         ok_marker, err_marker = "OK: " + cmd.strip(), "ERR: " + cmd.strip()
         lines = []
         deadline = time.monotonic() + timeout
@@ -237,10 +242,12 @@ class Console:
                 line = self._lines.get(timeout=remaining)
             except queue.Empty:
                 return Reply(lines, timed_out=True)
-            tail = line.rstrip()
-            if tail.endswith(ok_marker):
+            bare = line.strip()
+            while bare.startswith(">"):
+                bare = bare[1:].lstrip()
+            if bare == ok_marker:
                 return Reply(lines, ok=True)
-            if tail.endswith(err_marker) or REJECT in line:
+            if bare == err_marker or REJECT in line:
                 return Reply(lines, rejected=True)
             lines.append(line)
 
