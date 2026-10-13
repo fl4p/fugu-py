@@ -223,7 +223,10 @@ class Console:
             self.wait_for_banner()
         self.drain()
         self.write(cmd + self.eol)
-        ok_marker, err_marker = "OK: " + cmd, "ERR: " + cmd
+        # The firmware echoes the whole trimmed input after the marker (console.cpp loopConsole), so
+        # the marker must END the line: a substring test let a late `OK: dt 200 300` acknowledge
+        # `dt 200` while that command's own `ERR` stayed unread.
+        ok_marker, err_marker = "OK: " + cmd.strip(), "ERR: " + cmd.strip()
         lines = []
         deadline = time.monotonic() + timeout
         while True:
@@ -234,9 +237,10 @@ class Console:
                 line = self._lines.get(timeout=remaining)
             except queue.Empty:
                 return Reply(lines, timed_out=True)
-            if ok_marker in line:
+            tail = line.rstrip()
+            if tail.endswith(ok_marker):
                 return Reply(lines, ok=True)
-            if err_marker in line or REJECT in line:
+            if tail.endswith(err_marker) or REJECT in line:
                 return Reply(lines, rejected=True)
             lines.append(line)
 
