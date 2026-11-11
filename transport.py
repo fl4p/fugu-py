@@ -61,7 +61,16 @@ class SerialTransport(Transport):
         if '*' in port:
             port = glob.glob(port)[0]
         logger.info(f'opening serial port {port} @ {self.baud}')
+        # keep pyserial's default DTR/RTS=1: clearing them before open resets an ESP32-S3 on
+        # USB-Serial-JTAG on every open (measured on macOS); the default does not
         self.ser = serial.Serial(port, baudrate=self.baud, timeout=self.timeout)
+
+    def is_alive(self) -> bool:
+        return self.ser is not None and self.ser.is_open
+
+    def close(self):
+        if self.ser is not None:
+            self.ser.close()
 
     def write(self, data: bytes):
         self.ser.write(data)
