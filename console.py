@@ -17,14 +17,16 @@ class Reply(list):
     """Reply lines of a command, plus how the command terminated.
 
     Behaves as a plain list of lines (the OK/ERR completion marker is not included); `ok`,
-    `rejected` and `timed_out` say which terminated the collection.
+    `rejected` and `timed_out` say which terminated the collection; `dropped` (implies
+    `timed_out`) means the link went down first, e.g. the device rebooted.
     """
 
-    def __init__(self, lines=(), ok=False, rejected=False, timed_out=False):
+    def __init__(self, lines=(), ok=False, rejected=False, timed_out=False, dropped=False):
         super().__init__(lines)
         self.ok = ok
         self.rejected = rejected
-        self.timed_out = timed_out
+        self.timed_out = timed_out or dropped
+        self.dropped = dropped
 
     @property
     def text(self) -> str:
@@ -174,23 +176,24 @@ class Console:
             delay = min(delay * 2, 15.0)
         return False
 
-    def command(self, cmd: str, timeout: float = 4.0, retry=False, recover=0.0) -> Reply:
+    def command(self, cmd: str, timeout: float = 4.0, retry=False, recover=0.0, echo=None) -> Reply:
         """Send `cmd`, collect reply lines until the OK/ERR marker, a rejection, or timeout.
 
         `retry` reconnects and retries on a transport error or timeout, backing off between
         attempts: pass an int for the attempt count, or True for a default of 5. `recover` is a
         seconds budget for a deeper last resort: if the fast retries are exhausted, ride out a
         longer outage via `recover()` and re-issue the command once. Still raises / returns the
-        final timed-out Reply if the device never comes back.
+        final timed-out Reply if the device never comes back. `echo` is called with each reply
+        line as it arrives.
         """
         if not retry and not recover:
-            return self._command(cmd, timeout)
+            return self._command(cmd, timeout, echo)
         attempts = (retry if isinstance(retry, int) and not isinstance(retry, bool)
                     else (5 if retry else 1))
         backoff, last = 0.5, None
         for attempt in range(1, attempts + 1):
             try:
-                reply = self._command(cmd, timeout)
+                reply = self._command(cmd, timeout, echo)
                 if not reply.timed_out:
                     return reply
                 last = reply
@@ -207,7 +210,7 @@ class Console:
                 backoff = min(backoff * 2, 8.0)
         if recover and self.recover(recover):
             try:
-                reply = self._command(cmd, timeout)
+                reply = self._command(cmd, timeout, echo)
                 if not reply.timed_out:
                     return reply
                 last = reply
@@ -217,7 +220,7 @@ class Console:
             raise last
         return last  # the final timed-out Reply
 
-    def _command(self, cmd: str, timeout: float) -> Reply:
+    def _command(self, cmd: str, timeout: float, echo=None) -> Reply:
         if self._needs_banner:
             self._needs_banner = False  # one-shot, regardless of outcome
             self.wait_for_banner()
@@ -231,14 +234,18 @@ class Console:
             if remaining <= 0:
                 return Reply(lines, timed_out=True)
             try:
-                line = self._lines.get(timeout=remaining)
+                line = self._lines.get(timeout=min(remaining, 0.5))
             except queue.Empty:
-                return Reply(lines, timed_out=True)
+                if not self.is_alive():
+                    return Reply(lines, dropped=True)
+                continue
             if ok_marker in line:
                 return Reply(lines, ok=True)
             if err_marker in line or REJECT in line:
                 return Reply(lines, rejected=True)
             lines.append(line)
+            if echo:
+                echo(line)
 
     def wait_ready(self, probe="mem", timeout=30.0, probe_timeout=2.0) -> bool:
         """Poll `probe` until it is acknowledged — covers the boot / ADC-calibration window."""
