@@ -73,15 +73,24 @@ def decode_payload(cid, payload, tab):
                 tab[sid] = (frame.cstr(), frame.byte())
         elif ft == 1:                        # data
             def name(sid): return tab[sid][0]
-            meas = name(frame.varint())
+            try:
+                meas = name(frame.varint())
+            except KeyError:                 # table not seen yet: skip this frame, keep going
+                continue
             tags = []
-            while frame.b[frame.i] != 0:
-                k = name(frame.varint()); v = name(frame.varint()); tags.append(f'{k}={v}')
+            try:
+                while frame.b[frame.i] != 0:
+                    k = name(frame.varint()); v = name(frame.varint()); tags.append(f'{k}={v}')
+            except KeyError:
+                continue
             frame.i += 1                     # tag terminator
             fields = []
-            while frame.b[frame.i] != 0:
-                sid = frame.varint(); _, dt = tab[sid]
-                fields.append(f'{name(sid)}={fmt_field(dt, frame.take(DT[dt][1]))}')
+            try:
+                while frame.b[frame.i] != 0:
+                    sid = frame.varint(); _, dt = tab[sid]
+                    fields.append(f'{name(sid)}={fmt_field(dt, frame.take(DT[dt][1]))}')
+            except KeyError:
+                continue
             frame.i += 1                     # field terminator
             ts = frame.varint()
             line = meas + (',' + ','.join(tags) if tags else '') + ' ' + ','.join(fields) + ' ' + str(ts)
