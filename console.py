@@ -12,6 +12,58 @@ _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 # the firmware's final-else when it doesn't recognise a command
 REJECT = "unknown or unexpected command"
 
+_SECRET = ("pass", "psk", "key", "secret", "token", "cred")
+
+
+def _is_secret(k: str) -> bool:
+    k = k.lower()
+    return any(p in k for p in _SECRET)
+
+
+def mask_secrets(s: str) -> str:
+    """The firmware's masked form of a console line (src/etc/con_guard.h secretCut), as it appears in
+    the OK/ERR marker and in logs: the secret part becomes '***'."""
+    ws = " \t"
+    k = s.lstrip("#" + ws)
+    i = 0
+    while i < len(k) and k[i] != "=" and k[i] not in ws:
+        i += 1
+    q = i
+    while q < len(k) and k[q] in ws:
+        q += 1
+    if q < len(k) and k[q] == "=" and _is_secret(k[:i]):
+        return s[:len(s) - len(k) + q + 1] + "***"
+    cut = -1
+    w = s.lower().find("wifi-add")
+    if w >= 0:
+        c = s.find(":", w + 8)
+        if c >= 0:
+            cut = c + 1
+    u = s.find("://")
+    if u >= 0 and s.find("@", u + 3) >= 0 and (cut < 0 or u + 3 < cut):
+        cut = u + 3
+    p, n, word = 0, len(s), 0
+    while p < n:
+        while p < n and s[p] in ws:
+            p += 1
+        b = p
+        while p < n and s[p] not in ws:
+            p += 1
+        if b == p or not word:
+            word += 1
+            continue
+        word += 1
+        eq = s.find("=", b, p)
+        if not _is_secret(s[b:eq if eq >= 0 else p]):
+            continue
+        v = eq + 1 if eq >= 0 else p
+        while eq < 0 and v < n and s[v] in ws:
+            v += 1
+        if v < n and (cut < 0 or v < cut):
+            cut = v
+        break
+    return s if cut < 0 else s[:cut] + "***"
+
 
 class Reply(list):
     """Reply lines of a command, plus how the command terminated.
@@ -234,7 +286,10 @@ class Console:
         # late `OK: dt 200 300` acknowledge `dt 200` while that command's own `ERR` stayed unread,
         # and a suffix test still let `OK: set-config t tag OK: dt 200` do it. A marker glued to
         # other output now times out (unverified) instead of acknowledging.
-        ok_marker, err_marker = "OK: " + cmd.strip(), "ERR: " + cmd.strip()
+        # Secrets are masked in the marker (mask_secrets); older firmware echoes them in full.
+        c = cmd.strip()
+        ok_marker = {"OK: " + c, "OK: " + mask_secrets(c)}
+        err_marker = {"ERR: " + c, "ERR: " + mask_secrets(c)}
         lines = []
         deadline = time.monotonic() + timeout
         while True:
@@ -250,9 +305,9 @@ class Console:
             bare = line.strip()
             while bare.startswith(">"):
                 bare = bare[1:].lstrip()
-            if bare == ok_marker:
+            if bare in ok_marker:
                 return Reply(lines, ok=True)
-            if bare == err_marker or REJECT in line:
+            if bare in err_marker or REJECT in line:
                 return Reply(lines, rejected=True)
             lines.append(line)
             if echo:
