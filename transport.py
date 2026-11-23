@@ -184,6 +184,33 @@ class SocketTransport(Transport):
         return True
 
 
+class TlsPskTransport(SocketTransport):
+    """SocketTransport over TLS 1.2 with a pre-shared key (the firmware's `tlscon` service,
+    TLS-PSK-WITH-AES-128-GCM-SHA256). `key` is the raw key (bytes) or its hex string. Python >= 3.13."""
+    DEFAULT_PORT = 992
+
+    def __init__(self, ip, identity, key, port=DEFAULT_PORT, timeout=4):
+        super().__init__(ip, port=port, timeout=timeout, is_telnet=False)
+        self.identity = identity
+        self.key = bytes.fromhex(key) if isinstance(key, str) else bytes(key)
+
+    def open(self):
+        import ssl
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        if not hasattr(ctx, "set_psk_client_callback"):
+            raise RuntimeError("TLS-PSK needs Python >= 3.13")
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+        ctx.set_ciphers("PSK-AES128-GCM-SHA256")
+        ctx.set_psk_client_callback(lambda _hint: (self.identity, self.key))
+        super().open()
+        self.sock = ctx.wrap_socket(self.sock)
+
+    def check_connection(self) -> bool:
+        return self.sock is not None  # MSG_PEEK/MSG_DONTWAIT are not allowed on an SSLSocket
+
+
 class BleTransport(Transport):
     """Nordic UART Service (NUS) link to the firmware's BleConsoleService.
 
