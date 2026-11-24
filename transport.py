@@ -532,6 +532,7 @@ class EspHomeBleTransport(Transport):
     NUS_SERVICE = BleTransport.NUS_SERVICE
     RX_UUID = BleTransport.RX_UUID  # write  (host -> device)
     TX_UUID = BleTransport.TX_UUID  # notify (device -> host)
+    CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"
     API_PORT = 6053  # ESPHome native API
     ATT_CHUNK = BleTransport.ATT_CHUNK
 
@@ -694,17 +695,25 @@ class EspHomeBleTransport(Transport):
         await state  # already resolved; raises if the connection response reported a failure
 
         svcs = await self._api.bluetooth_gatt_get_services(self._addr_int)
+        cccd = None
         for s in svcs.services:
             for c in s.characteristics:
                 if c.uuid == self.RX_UUID:
                     self._rx_handle = c.handle
                 elif c.uuid == self.TX_UUID:
                     self._tx_handle = c.handle
+                    cccd = next((d.handle for d in c.descriptors if d.uuid.lower() == self.CCCD_UUID), None)
         if self._rx_handle is None or self._tx_handle is None:
             raise RuntimeError("peripheral has no NUS RX/TX characteristics")
+        if cccd is None:
+            raise RuntimeError("NUS TX characteristic has no CCCD")
 
         self._stop_notify, _ = await self._api.bluetooth_gatt_start_notify(
             self._addr_int, self._tx_handle, self._on_notify)
+        # The notify request only registers the proxy-side callback (aioesphomeapi and the proxy
+        # leave the CCCD to the client, as bleak-esphome does); without this write a peer only
+        # notifies if it restored a subscription stored with the bond.
+        await self._api.bluetooth_gatt_write_descriptor(self._addr_int, cccd, b'\x01\x00')
 
     def _on_notify(self, _handle, data):
         self._rx.put(bytes(data))
