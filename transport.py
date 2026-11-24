@@ -536,7 +536,7 @@ class EspHomeBleTransport(Transport):
     ATT_CHUNK = BleTransport.ATT_CHUNK
 
     def __init__(self, host, proxy_port=API_PORT, password="", address=None, name="fugu",
-                 address_type=0, scan_timeout=15.0, connect_timeout=20.0, connect_retries=2,
+                 address_type=0, scan_timeout=30.0, connect_timeout=20.0, connect_retries=2,
                  read_timeout=0.3):
         self.host = host
         self.proxy_port = proxy_port
@@ -619,7 +619,8 @@ class EspHomeBleTransport(Transport):
             for a in resp.advertisements:
                 name, uuids, mfr = self._parse_adv(bytes(a.data))
                 has_nus = self.NUS_SERVICE in uuids or BleTransport.is_tele_adv(mfr)
-                ok = (want in name.lower()) if want else has_nus
+                # fugu firmware puts the NUS UUID in the scan response, which a passive proxy never sees
+                ok = (want in name.lower()) if want else has_nus or name.lower().startswith("fugu")
                 if ok:
                     found.set_result((a.address, a.address_type, name))
                     return
