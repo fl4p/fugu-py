@@ -802,6 +802,28 @@ class MqttTransport(Transport):
         self._buf = b''
         self._client = None
         self._learned = threading.Event()
+        self._subscribed = threading.Event()
+        self._connect_rc = None
+        self._echo = threading.Condition()
+        self._want = None  # command awaiting its echo on .../cmd, and how often it came back
+        self._got = 0
+        self._echo_timeout = 15.0  # a tunnelled broker can take several s
+
+    def _on_connect(self, client, _userdata, _flags, rc, _props=None):
+        self._connect_rc = rc
+        if not rc.is_failure:
+            client.subscribe(self.LOG_ROOT + "#")  # output is pv/log/<hostname>, cmd echo is .../cmd
+
+    def _on_cmd_echo(self, _client, _userdata, msg):
+        if msg.topic == f"{self.LOG_ROOT}{self.hostname}/cmd":
+            with self._echo:
+                if msg.payload == self._want:
+                    self._got += 1
+                    self._echo.notify_all()
+
+    def _on_subscribe(self, _client, _userdata, _mid, reason_codes, _props=None):
+        if not any(rc.is_failure for rc in reason_codes):
+            self._subscribed.set()
 
     def open(self):
         if self._client is not None:
@@ -812,11 +834,18 @@ class MqttTransport(Transport):
         if self.username:
             c.username_pw_set(self.username, self.password or "")
         c.on_message = self._on_message
+        c.on_connect = self._on_connect
+        c.on_subscribe = self._on_subscribe
+        c.message_callback_add(self.LOG_ROOT + "+/cmd", self._on_cmd_echo)
         logger.info("connecting to broker %s:%u", self.host, self.port)
         c.connect(self.host, self.port, 60)
-        c.subscribe(self.LOG_ROOT + "#")  # output is pv/log/<hostname>, cmd echo is .../cmd
         c.loop_start()
         self._client = c
+        # a command published before CONNACK/SUBACK is lost without an error, so wait for both
+        if not self._subscribed.wait(self.discover_timeout):
+            self.close()
+            raise ConnectionError(f"MQTT broker {self.host}:{self.port}: no CONNACK/SUBACK within "
+                                  f"{self.discover_timeout:g} s ({self._connect_rc or 'no reply'})")
         # learn the device hostname from its log stream (needed to address the command topic)
         if not self._learned.wait(self.discover_timeout):
             if self.device:
@@ -829,7 +858,7 @@ class MqttTransport(Transport):
     def _on_message(self, _client, _userdata, msg):
         parts = msg.topic.split("/")
         if len(parts) != 3:
-            return  # pv/log/<hostname> only; ignore the deeper .../cmd echo
+            return
         hostname = parts[2]
         if self.device.lower() not in hostname.lower():
             return
@@ -862,7 +891,17 @@ class MqttTransport(Transport):
         # MQTT is message-framed, not a byte stream: publish one trimmed command per write
         cmd = data.decode("utf-8", "replace").strip()
         if cmd:
-            self._client.publish(f"{self.LOG_ROOT}{self.hostname}/cmd", cmd, qos=0)
+            # QoS 0 is never retransmitted, so a command cannot run twice; the broker routing it
+            # back to our own pv/log/# subscription confirms it was accepted
+            with self._echo:
+                self._want, self._got = cmd.encode(), 0
+            # paho's loop thread holds its callback mutex while delivering the echo: publish unlocked
+            rc = self._client.publish(f"{self.LOG_ROOT}{self.hostname}/cmd", cmd, qos=0).rc
+            if rc != 0:
+                raise ConnectionError(f"MQTT publish of {cmd!r} failed (rc {rc})")
+            with self._echo:
+                if not self._echo.wait_for(lambda: self._got > 0, self._echo_timeout):
+                    raise ConnectionError(f"MQTT broker did not route command {cmd!r} back within {self._echo_timeout:g} s")
 
     def close(self):
         if self._client is not None:
@@ -872,3 +911,4 @@ class MqttTransport(Transport):
             except Exception as e:
                 logger.debug("mqtt disconnect: %s", e)
             self._client = None
+        self._subscribed.clear()
