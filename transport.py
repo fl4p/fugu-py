@@ -385,8 +385,9 @@ class BleTransport(Transport):
             raise RuntimeError(f"no device matched {what} (is it advertising? `svc on ble`)"
                                + await self._discovery_hint())
         logger.info("connecting to %s [%s]", dev.name, dev.address)
-        # macOS can keep a stale bond after a reflash ("Peer removed pairing information"); the
-        # failed attempt usually drops the bond, so retry a couple of times.
+        # A stale macOS LE bond ("Peer removed pairing information", the peer lost its keys) fails
+        # every attempt: retries and `blueutil --unpair` do not clear it, only System Settings ->
+        # Bluetooth -> Forget This Device does. Retries cover transient connect failures.
         last = None
         client = None
         for attempt in range(1, self.connect_retries + 1):
