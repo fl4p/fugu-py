@@ -1,6 +1,6 @@
 {
   "project": "pmini",
-  "revision": "af4fc728cf94ef951b42113b538b14de629f0a83",
+  "revision": "5e80ea4b39d5209846beac6f1602d882af1547a8",
   "files": [
     {
       "source": "pmini/strict.py",
