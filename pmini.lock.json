@@ -1,6 +1,6 @@
 {
   "project": "pmini",
-  "revision": "5e80ea4b39d5209846beac6f1602d882af1547a8",
+  "revision": "a40626d9b987f8c5b69d8dbf33af41c9c37b8344",
   "files": [
     {
       "source": "pmini/strict.py",
@@ -12,5 +12,6 @@
       "path": "PMINI-LICENSE",
       "sha256": "5b51ad10c69a71d030633b4464292e6193b54cd35e91d7f490bc463fae7d3c3c"
     }
-  ]
+  ],
+  "repository": "https://github.com/fl4p/pmini"
 }
