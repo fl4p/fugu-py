@@ -1,0 +1,16 @@
+{
+  "project": "pmini",
+  "revision": "af4fc728cf94ef951b42113b538b14de629f0a83",
+  "files": [
+    {
+      "source": "pmini/strict.py",
+      "path": "_pmini_mtp2.py",
+      "sha256": "6e3d913a0fe20add545c3c553becf9fcd98ef2aa7a33b6c3be5564e1f88519a2"
+    },
+    {
+      "source": "LICENSE",
+      "path": "PMINI-LICENSE",
+      "sha256": "5b51ad10c69a71d030633b4464292e6193b54cd35e91d7f490bc463fae7d3c3c"
+    }
+  ]
+}
